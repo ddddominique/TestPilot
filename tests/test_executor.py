@@ -203,9 +203,11 @@ def test_docker_timeout_is_bounded_and_container_is_removed(tmp_path):
 
 
 def test_docker_startup_failure_is_infrastructure_error(tmp_path):
-    payload = DockerRunner(backend=FakeBackend()).run(docker_workspace(tmp_path))
+    backend = FakeBackend()
+    payload = DockerRunner(backend=backend).run(docker_workspace(tmp_path))
     assert payload["status"] == "INFRASTRUCTURE_ERROR"
     assert "structured results" in payload["error"]
+    assert any(cmd[:3] == ["docker", "rm", "-f"] for cmd in backend.commands)
 
 
 def test_host_docker_output_capture_is_bounded():
@@ -236,10 +238,27 @@ def valid_payload():
     }
 
 
-@pytest.mark.parametrize("timeout,status", [(True, "TIMEOUT"), (False, "TEST_FAILED")])
+@pytest.mark.parametrize("original_status", ["PASSED", "TEST_FAILED", "TIMEOUT"])
+def test_successful_cleanup_retains_original_execution_status(tmp_path, original_status):
+    payload = valid_payload()
+    if original_status == "TEST_FAILED":
+        payload.update(status="TEST_FAILED", passed=0, failed=1, exit_code=1, error="assertion failed")
+    backend = FakeBackend(
+        CommandResult(0, "TESTPILOT_RESULT_JSON=" + json.dumps(payload), 0.1),
+        timeout=original_status == "TIMEOUT",
+    )
+    result = DockerRunner(backend=backend).run(docker_workspace(tmp_path))
+    assert result["status"] == original_status
+    assert result["warnings"] == []
+    assert any(cmd[:3] == ["docker", "rm", "-f"] for cmd in backend.commands)
+
+
+@pytest.mark.parametrize("timeout,status", [(True, "TIMEOUT"), (False, "TEST_FAILED"), (False, "PASSED")])
 @pytest.mark.parametrize("cleanup_failure", [OSError("daemon disconnected"), CommandTimeout("", 10)])
-def test_cleanup_failure_preserves_execution_outcome(tmp_path, timeout, status, cleanup_failure):
-    payload = dict(valid_payload(), status="TEST_FAILED", passed=0, failed=1, exit_code=1, error="assertion failed")
+def test_cleanup_failure_reports_infrastructure_error_and_preserves_diagnostics(tmp_path, timeout, status, cleanup_failure):
+    payload = valid_payload()
+    if status == "TEST_FAILED":
+        payload.update(status="TEST_FAILED", passed=0, failed=1, exit_code=1, error="assertion failed")
 
     class BrokenCleanup(FakeBackend):
         def run(self, command, timeout, max_output):
@@ -250,10 +269,24 @@ def test_cleanup_failure_preserves_execution_outcome(tmp_path, timeout, status, 
 
     backend = BrokenCleanup(CommandResult(0, "TESTPILOT_RESULT_JSON=" + json.dumps(payload), 0.1), timeout=timeout)
     result = DockerRunner(backend=backend).run(docker_workspace(tmp_path))
-    assert result["status"] == status
+    assert result["status"] == "INFRASTRUCTURE_ERROR"
     container = next(cmd[3] for cmd in backend.commands if cmd[:3] == ["docker", "run", "--name"])
     assert f"docker rm -f {container}" in result["warnings"][0]
-    assert result["error"] == ("Execution exceeded 60 seconds" if timeout else "assertion failed")
+    assert f"Original execution status: {status}" in result["warnings"][0]
+    if timeout:
+        assert result["error"] == "Execution exceeded 60 seconds"
+        assert result["output"] == "partial"
+        assert result["exit_code"] is None
+        assert result["duration_seconds"] == 2.0
+    else:
+        for key in ("passed", "failed", "skipped", "exit_code", "duration_seconds", "output"):
+            assert result[key] == payload[key]
+        if status == "TEST_FAILED":
+            assert result["error"] == "assertion failed"
+        else:
+            assert f"docker rm -f {container}" in result["error"]
+    from testpilot.execution_models import validate_runner_payload
+    validate_runner_payload(result)
 
 
 def test_provenance_uses_recorded_id_instead_of_local_tag(tmp_path):
@@ -311,7 +344,7 @@ def test_malformed_and_oversized_wire_results_are_rejected():
     assert DockerRunner._parse_result('TESTPILOT_RESULT_JSON={"status":"PASSED","status":"TEST_FAILED"}') is None
 
 
-def test_passed_result_with_full_warning_list_survives_nonzero_cleanup(tmp_path):
+def test_passed_result_with_full_warning_list_reports_failed_cleanup_through_executor(tmp_path):
     payload = dict(valid_payload(), warnings=["fixture warning"] * 32)
 
     class FailedRemoval(FakeBackend):
@@ -332,10 +365,16 @@ def test_passed_result_with_full_warning_list_survives_nonzero_cleanup(tmp_path)
     result = TestExecutor(Manager(), runner).execute(
         pr(), FrameworkDetection("python", "pytest"), generation(proposal())
     )
-    assert result.status == ExecutionStatus.PASSED
+    assert result.status == ExecutionStatus.INFRASTRUCTURE_ERROR
+    assert not result.successful
     assert result.passed == 1
     assert len(result.warnings) == 33
     assert "docker rm -f testpilot-" in result.warnings[-1]
+    assert "Original execution status: PASSED" in result.warnings[-1]
+    from testpilot.cli import format_execution_summary
+    report = format_execution_summary(result)
+    assert "Overall status: INFRASTRUCTURE_ERROR" in report
+    assert "1 passed, 0 failed" in report
 
 
 def test_missing_provenance_prevents_docker_run(tmp_path, monkeypatch):

@@ -125,7 +125,11 @@ def main() -> int:
         error = "A module could not be resolved. It may be an unavailable dependency or an incorrect generated import."
     elif plugin.collection_errors or plugin.setup_errors or plugin.teardown_errors or exit_code in {2, 3, 4}:
         status = "COLLECTION_ERROR"
-        error = "Pytest could not collect or set up the generated tests."
+        error = (
+            "Pytest encountered collection, setup, or teardown errors: "
+            f"collection={plugin.collection_errors}, setup={plugin.setup_errors}, "
+            f"teardown={plugin.teardown_errors}."
+        )
     elif plugin.failed or exit_code == 1:
         status = "TEST_FAILED"
         error = "One or more generated tests failed. This may indicate a regression or an incorrect generated test."

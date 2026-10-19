@@ -185,7 +185,7 @@ Execution flow:
 4. `runner/pytest_runner.py` runs only the explicit generated paths. It disables repository configuration, `conftest.py`, and automatic plugin loading. Python starts in isolated mode before the runner adds the snapshot and its `src/` directory to the import path. No setup scripts or dependency installation run.
 5. `execution_models.py` validates every required payload field without coercion, enforces bounded output/diagnostics, and checks status/count/exit-code consistency. Malformed, missing, oversized, truncated, or inconsistent reports fail as infrastructure errors. It carries status, commit, files, counts, duration, output, and errors back to the CLI.
 
-Container cleanup is always attempted. If removal fails, the original timeout or test outcome is preserved and a warning names the container and gives `docker rm -f <container-name>` for recovery. Check that warning even after passing tests; an incomplete removal may leave the restricted container running. Temporary workspace cleanup is still attempted.
+Container cleanup is always attempted. If removal fails, overall status becomes `INFRASTRUCTURE_ERROR` and the CLI exits nonzero, even if tests passed. Counts, output, exit code, duration, and any original execution error remain intact. A warning records the original status, names the container, and gives `docker rm -f <container-name>` for recovery. An incomplete removal may leave the restricted container running. Temporary workspace cleanup is still attempted.
 
 Example report:
 

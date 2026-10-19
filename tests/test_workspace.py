@@ -1,6 +1,8 @@
 import io
+import gzip
 import tarfile
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -135,3 +137,39 @@ def test_materialization_rejects_colocated_source_path_before_execution():
         WorkspaceManager(FakeGitHub(archive_bytes({"app.py": "value = 1"}))).prepare(
             pr(), generation(item)
         )
+
+
+def test_rejects_negative_size_in_real_tar_metadata():
+    root = tarfile.TarInfo("snapshot/")
+    root.type = tarfile.DIRTYPE
+    invalid = tarfile.TarInfo("snapshot/app.py")
+    invalid.size = -1
+    raw = root.tobuf(format=tarfile.GNU_FORMAT) + invalid.tobuf(format=tarfile.GNU_FORMAT) + b"\0" * 1024
+    github = FakeGitHub(gzip.compress(raw))
+    with pytest.raises(WorkspaceError, match="Invalid archive file size"):
+        WorkspaceManager(github).prepare(pr(), generation(proposal()))
+
+
+@pytest.mark.parametrize("size", [-1, True, "10", 1.5, None])
+def test_rejects_invalid_member_sizes_before_extraction(tmp_path, monkeypatch, size):
+    archive = tmp_path / "snapshot.gz"
+    archive.write_bytes(gzip.compress(b""))
+    destination = tmp_path / "source"
+    destination.mkdir()
+    member = tarfile.TarInfo("snapshot/app.py")
+    member.size = size
+    context = MagicMock()
+    context.__enter__.return_value = [member]
+    monkeypatch.setattr("testpilot.workspace.tarfile.open", lambda **kwargs: context)
+    with pytest.raises(WorkspaceError, match="Invalid archive file size"):
+        WorkspaceManager(FakeGitHub(b""))._extract_archive(archive, destination)
+    assert list(destination.iterdir()) == []
+
+
+def test_rejects_nonzero_directory_size_in_tar_metadata():
+    root = tarfile.TarInfo("snapshot/")
+    root.type = tarfile.DIRTYPE
+    root.size = 5
+    raw = root.tobuf(format=tarfile.GNU_FORMAT) + b"\0" * 1024
+    with pytest.raises(WorkspaceError, match="Invalid archive directory size"):
+        WorkspaceManager(FakeGitHub(gzip.compress(raw))).prepare(pr(), generation(proposal()))

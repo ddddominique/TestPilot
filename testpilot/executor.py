@@ -206,7 +206,18 @@ class DockerRunner:
                 "warnings": ["Docker output was truncated"] if result.truncated else [],
             }
         if cleanup_warning:
-            payload["warnings"].append(cleanup_warning)
+            original_status = payload["status"]
+            original_code = payload["exit_code"]
+            payload["warnings"].append(
+                f"Cleanup incomplete. Original execution status: {original_status} "
+                f"(exit code: {original_code}). {cleanup_warning}"
+            )
+            payload["status"] = ExecutionStatus.INFRASTRUCTURE_ERROR.value
+            # Keep counts, output, duration, exit code and the original error
+            # intact. Successful tests need a new error explaining why the
+            # overall execution now requires manual recovery.
+            if not payload["error"]:
+                payload["error"] = cleanup_warning
         return payload
 
     def _remove(self, container_name: str) -> None:

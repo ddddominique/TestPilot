@@ -113,6 +113,10 @@ class WorkspaceManager:
                 file_count += 1
                 if file_count > self.max_archive_files:
                     raise WorkspaceError("Snapshot exceeds extraction limits")
+                if type(member.size) is not int or member.size < 0:
+                    raise WorkspaceError(f"Invalid archive file size for {member.name}")
+                if member.isdir() and member.size != 0:
+                    raise WorkspaceError(f"Invalid archive directory size for {member.name}")
                 if "\\" in member.name or any(
                     part in {"", ".", ".."} for part in member.name.rstrip("/").split("/")
                 ):

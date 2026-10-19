@@ -21,6 +21,7 @@ def runner(monkeypatch):
 @pytest.mark.parametrize("outcome,expected", [
     ("passed", "PASSED"), ("failed", "TEST_FAILED"),
     ("dependency", "DEPENDENCY_ERROR"), ("collection", "COLLECTION_ERROR"),
+    ("setup", "COLLECTION_ERROR"), ("teardown", "COLLECTION_ERROR"),
     ("skipped", "COLLECTION_ERROR"), ("empty", "COLLECTION_ERROR"),
 ])
 def test_trusted_runner_classification(runner, monkeypatch, capsys, outcome, expected):
@@ -44,6 +45,15 @@ def test_trusted_runner_classification(runner, monkeypatch, capsys, outcome, exp
             return 2
         if outcome == "empty":
             return 5
+        if outcome in {"setup", "teardown"}:
+            if outcome == "teardown":
+                plugin.pytest_runtest_logreport(SimpleNamespace(
+                    when="call", passed=True, failed=False, skipped=False,
+                ))
+            plugin.pytest_runtest_logreport(SimpleNamespace(
+                when=outcome, passed=False, failed=True, skipped=False,
+            ))
+            return 1
         plugin.pytest_runtest_logreport(SimpleNamespace(
             when="call", passed=outcome == "passed", failed=outcome == "failed",
             skipped=outcome == "skipped", longrepr=None,
@@ -58,6 +68,15 @@ def test_trusted_runner_classification(runner, monkeypatch, capsys, outcome, exp
     output = capsys.readouterr().out
     payload = json.loads(output.split(runner.MARKER, 1)[1])
     assert payload["status"] == expected
+    if outcome in {"collection", "setup", "teardown"}:
+        assert "collection, setup, or teardown" in payload["error"]
+        assert f"{outcome}=1" in payload["error"]
+        assert payload["failed"] == 0
+        assert payload["passed"] == (1 if outcome == "teardown" else 0)
+    if outcome == "failed":
+        assert payload["failed"] == 1
+    from testpilot.execution_models import validate_runner_payload
+    validate_runner_payload(payload)
 
 
 def test_runner_writer_bounds_output(runner):
