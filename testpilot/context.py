@@ -1,5 +1,6 @@
 """Select and download a bounded, test-oriented repository context."""
 
+import re
 from pathlib import PurePosixPath
 
 from .github import GitHubAPIError, GitHubClient
@@ -103,9 +104,8 @@ class ContextCollector:
         ]
         tests = list(dict.fromkeys(changed_tests + discovered_tests))
         configs = [path for path in tree if _is_config(path)]
-        # Configuration and representative tests come first. The fair-share
-        # allocator below also reserves space for every selected item, so a
-        # large early file cannot consume the complete budget.
+        # Represent each category, then favor changed source, configuration,
+        # and representative tests in that order.
         candidates = _prioritize_files(configs, tests, sources, self.max_files)
 
         contents: list[tuple[str, str, str]] = []
@@ -163,7 +163,7 @@ class ContextCollector:
             warnings.append(f"Omitted {len(omitted)} context file(s) because of limits or retrieval errors.")
         return CollectedContext(
             collected, sources, tests, configs, omitted, warnings,
-            title, description, patches, self.max_characters,
+            title, description, patches, self.max_characters, tree,
         )
 
 
@@ -176,17 +176,35 @@ def _allocate_fairly(
     for index, (category, name, content) in enumerate(fragments):
         items_left = len(fragments) - index
         allowance = remaining // items_left if items_left else 0
-        selected = content[:allowance]
+        selected = _truncate_at_boundary(content, allowance, category)
         result.append((category, name, selected, len(selected) < len(content)))
         remaining -= len(selected)
     return result
+
+
+def _truncate_at_boundary(content: str, limit: int, category: str) -> str:
+    """Prefer complete lines, and complete diff hunks when one fits."""
+    if len(content) <= limit:
+        return content
+    if limit <= 0:
+        return ""
+    prefix = content[:limit]
+    newline = prefix.rfind("\n")
+    if newline <= 0:
+        return prefix
+    boundary = newline + 1
+    if category == "patch":
+        hunk_starts = [match.start() for match in re.finditer(r"(?m)^@@", prefix[:boundary])]
+        if len(hunk_starts) > 1:
+            boundary = hunk_starts[-1]
+    return content[:boundary]
 
 
 def _prioritize_files(
     configs: list[str], tests: list[str], sources: list[str], limit: int
 ) -> list[str]:
     """Select deterministically, representing every available category first."""
-    groups = (configs, tests, sources)
+    groups = (sources, configs, tests)
     selected: list[str] = []
     for group in groups:
         if group and len(selected) < limit and group[0] not in selected:

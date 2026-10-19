@@ -55,6 +55,7 @@ class CollectedContext:
     pr_description: str = ""
     patches: list[ContextPatch] = field(default_factory=list)
     max_characters: int = 0
+    repository_files: list[str] = field(default_factory=list)
 
     @property
     def total_characters(self) -> int:

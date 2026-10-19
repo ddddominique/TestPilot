@@ -17,7 +17,7 @@ def test_detects_pytest_from_configuration_and_import():
 
 def test_detects_pytest_from_pyproject_dependency_declaration():
     result = detect_framework(context([
-        ContextFile("pyproject.toml", "config", 'dependencies = ["pytest>=8"]'),
+        ContextFile("pyproject.toml", "config", '[project]\ndependencies = ["pytest>=8"]'),
     ]))
     assert result.framework == "pytest"
 
@@ -58,3 +58,45 @@ def test_monorepo_prefers_framework_near_changed_source():
         ContextFile("packages/ui/vitest.config.ts", "config", "export default {}"),
     ], ["packages/ui/src/button.tsx"]))
     assert result.framework == "vitest"
+
+
+def test_python_source_config_string_is_not_framework_evidence():
+    result = detect_framework(context([
+        ContextFile("src/app.py", "source", 'EXAMPLE = "[tool.pytest.ini_options]"'),
+    ]))
+    assert result.framework == "unknown"
+
+
+def test_package_description_is_not_dependency_evidence():
+    result = detect_framework(context([
+        ContextFile("package.json", "config", '{"description":"pytest jest vitest"}'),
+    ], ["src/app.ts"]))
+    assert result.framework == "unknown"
+
+
+def test_source_mentions_without_imports_are_not_evidence():
+    result = detect_framework(context([
+        ContextFile(
+            "src/app.ts", "source",
+            '// migrate from Jest to Vitest\nconst name = "vitest";\n'
+            'const docs = `\nimport { test } from "vitest";\n`;\n'
+            '/* import { test } from "@jest/globals"; */',
+        ),
+    ], ["src/app.ts"]))
+    assert result.framework == "unknown"
+
+
+def test_actual_ini_and_requirements_declarations_detect_pytest():
+    result = detect_framework(context([
+        ContextFile("setup.cfg", "config", "[tool:pytest]\naddopts = -q"),
+        ContextFile("requirements-dev.txt", "config", "pytest>=8\n"),
+    ]))
+    assert result.framework == "pytest"
+
+
+def test_malformed_configuration_does_not_invent_dependency_evidence():
+    result = detect_framework(context([
+        ContextFile("pyproject.toml", "config", '[project\ndependencies = ["pytest"]'),
+        ContextFile("package.json", "config", '{"devDependencies":{"jest":'),
+    ]))
+    assert result.framework == "unknown"
