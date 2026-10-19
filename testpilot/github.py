@@ -1,6 +1,7 @@
 """Minimal GitHub REST API client used by TestPilot."""
 
 import base64
+import binascii
 import os
 import re
 from typing import Any, Iterator, Optional
@@ -75,15 +76,33 @@ class GitHubClient:
 
         if response.status_code >= 400:
             try:
-                detail = response.json().get("message", response.text)
-            except (ValueError, AttributeError):
+                error_payload = response.json()
+                detail = (
+                    error_payload.get("message", response.text)
+                    if isinstance(error_payload, dict) else response.text
+                )
+            except ValueError:
                 detail = response.text or "unknown error"
+            detail = str(detail or "unknown error")
             remaining = response.headers.get("X-RateLimit-Remaining")
-            if response.status_code in (403, 429) and remaining == "0":
+            retry_after = response.headers.get("Retry-After")
+            rate_limited = (
+                response.status_code == 429
+                or (response.status_code == 403 and remaining == "0")
+                or (response.status_code == 403 and retry_after is not None)
+                or (
+                    response.status_code == 403
+                    and ("rate limit" in detail.lower() or "abuse detection" in detail.lower())
+                )
+            )
+            if rate_limited:
                 reset = response.headers.get("X-RateLimit-Reset", "unknown")
+                kind = "secondary" if retry_after or remaining != "0" else "primary"
+                retry = f", retry after: {retry_after}s" if retry_after else ""
                 raise GitHubRateLimitError(
-                    f"GitHub API rate limit exceeded (reset timestamp: {reset}). "
-                    "Set GITHUB_TOKEN for a higher limit.",
+                    f"GitHub {kind} API rate limit exceeded "
+                    f"(reset timestamp: {reset}{retry}). "
+                    "Wait before retrying; GITHUB_TOKEN raises the primary limit.",
                     response.status_code,
                 )
             raise GitHubAPIError(
@@ -112,18 +131,40 @@ class GitHubClient:
         owner, repository, number = self.parse_pr_url(pr_url)
         root = f"{API_ROOT}/repos/{owner}/{repository}"
         data = self._get(f"{root}/pulls/{number}")
+        if not isinstance(data, dict):
+            raise GitHubAPIError("Malformed pull request response: expected an object")
+        try:
+            title = data["title"]
+            base_sha = data["base"]["sha"]
+            head_sha = data["head"]["sha"]
+        except (KeyError, TypeError) as exc:
+            raise GitHubAPIError("Malformed pull request response: missing required fields") from exc
+        if not all(isinstance(value, str) for value in (title, base_sha, head_sha)):
+            raise GitHubAPIError("Malformed pull request response: invalid required fields")
+        body = data.get("body")
+        if body is not None and not isinstance(body, str):
+            raise GitHubAPIError("Malformed pull request response: invalid body")
         file_data = list(self._paginate(f"{root}/pulls/{number}/files"))
         warnings: list[str] = []
         files: list[ChangedFile] = []
         for item in file_data:
+            if not isinstance(item, dict) or not isinstance(item.get("filename"), str):
+                raise GitHubAPIError("Malformed changed-files response")
             patch = item.get("patch")
             filename = item["filename"]
+            if patch is not None and not isinstance(patch, str):
+                raise GitHubAPIError(f"Malformed patch for {filename}")
             if patch is None:
                 warnings.append(
-                    f"Patch unavailable for {filename} (binary or too large for the API)."
+                    f"Patch unavailable for {filename}; it may be binary or omitted by GitHub."
                 )
-            elif item.get("changes", 0) > 0 and len(patch) >= 10000:
-                warnings.append(f"Patch may be truncated for {filename}.")
+            elif _patch_may_be_incomplete(patch, item.get("additions"), item.get("deletions")):
+                warnings.append(
+                    f"Patch for {filename} may be incomplete; GitHub does not report patch truncation explicitly."
+                )
+            numeric_fields = (item.get("additions", 0), item.get("deletions", 0), item.get("changes", 0))
+            if any(not isinstance(value, int) or isinstance(value, bool) for value in numeric_fields):
+                raise GitHubAPIError(f"Malformed change counts for {filename}")
             files.append(
                 ChangedFile(
                     filename=filename,
@@ -139,10 +180,10 @@ class GitHubClient:
             owner=owner,
             repository=repository,
             number=number,
-            title=data.get("title", ""),
-            description=data.get("body") or "",
-            base_sha=data["base"]["sha"],
-            head_sha=data["head"]["sha"],
+            title=title,
+            description=body or "",
+            base_sha=base_sha,
+            head_sha=head_sha,
             files=files,
             warnings=warnings,
         )
@@ -152,7 +193,18 @@ class GitHubClient:
             f"{API_ROOT}/repos/{owner}/{repository}/git/trees/{sha}",
             {"recursive": "1"},
         )
-        paths = [item["path"] for item in payload.get("tree", []) if item.get("type") == "blob"]
+        if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
+            raise GitHubAPIError("Malformed repository tree response")
+        if "truncated" in payload and not isinstance(payload["truncated"], bool):
+            raise GitHubAPIError("Malformed repository tree response: invalid truncated flag")
+        paths: list[str] = []
+        for item in payload["tree"]:
+            if not isinstance(item, dict):
+                raise GitHubAPIError("Malformed repository tree entry")
+            if item.get("type") == "blob":
+                if not isinstance(item.get("path"), str):
+                    raise GitHubAPIError("Malformed repository tree path")
+                paths.append(item["path"])
         return paths, bool(payload.get("truncated"))
 
     def get_file_content(self, owner: str, repository: str, path: str, ref: str) -> str:
@@ -161,10 +213,20 @@ class GitHubClient:
         )
         if not isinstance(payload, dict) or payload.get("type") != "file":
             raise GitHubAPIError(f"{path} is not a file")
-        if payload.get("encoding") != "base64" or "content" not in payload:
+        if payload.get("encoding") != "base64" or not isinstance(payload.get("content"), str):
             raise GitHubAPIError(f"Content unavailable for {path}")
         try:
-            raw = base64.b64decode(payload["content"], validate=False)
+            encoded = "".join(payload["content"].split())
+            raw = base64.b64decode(encoded, validate=True)
             return raw.decode("utf-8")
-        except (ValueError, UnicodeDecodeError) as exc:
+        except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
             raise GitHubAPIError(f"Could not decode text content for {path}") from exc
+
+
+def _patch_may_be_incomplete(patch: str, additions: Any, deletions: Any) -> bool:
+    """Infer possible omission from diff counts, never from patch byte length alone."""
+    if not isinstance(additions, int) or not isinstance(deletions, int):
+        return False
+    added = sum(line.startswith("+") and not line.startswith("+++") for line in patch.splitlines())
+    deleted = sum(line.startswith("-") and not line.startswith("---") for line in patch.splitlines())
+    return added < additions or deleted < deletions
