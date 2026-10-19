@@ -18,7 +18,6 @@ from testpilot.execution_models import ExecutionResult, ExecutionStatus
 from testpilot.generation_models import FrameworkDetection, GenerationResult
 from testpilot.models import PullRequest
 from testpilot.pipeline import PipelineResult
-from testpilot.worker.dispatcher import dispatch_once
 from testpilot.worker.tasks import run_job
 
 
@@ -26,7 +25,7 @@ from testpilot.worker.tasks import run_job
     not os.getenv("TESTPILOT_TEST_DATABASE_URL"),
     reason="Set TESTPILOT_TEST_DATABASE_URL to a dedicated PostgreSQL test database",
 )
-def test_real_postgresql_migration_pending_run_jsonb_and_rollback():
+def test_real_postgresql_migration_pending_run_jsonb_and_rollback(broker):
     url = database_url(os.environ["TESTPILOT_TEST_DATABASE_URL"])
     schema = "testpilot_test_" + uuid4().hex
     admin = create_engine(url)
@@ -61,9 +60,7 @@ def test_real_postgresql_migration_pending_run_jsonb_and_rollback():
             assert client.get(f"/api/runs/{record['id']}").json() == record
             finished = client.post(f"/api/runs/{record['id']}/execute")
             assert finished.status_code == 202
-            published = Mock()
-            assert dispatch_once(sessions, published)
-            published.assert_called_once()
+            broker.assert_called_once()
             run_job(record["id"], finished.json()["task_id"], sessions, lambda: pipeline)
             finished = client.get(f"/api/runs/{record['id']}")
             assert finished.status_code == 200

@@ -6,7 +6,6 @@ from celery import Celery
 
 HARD_TIME_LIMIT = 1_800
 SOFT_TIME_LIMIT = 1_740
-RECONCILE_MIN_AGE = HARD_TIME_LIMIT + 600
 
 app = Celery("testpilot", broker=os.getenv("CELERY_BROKER_URL", "redis://127.0.0.1:6379/0"),
              include=["testpilot.worker.tasks"])

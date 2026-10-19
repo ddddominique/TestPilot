@@ -1,1 +1,1 @@
-"""Trusted background execution and durable broker dispatch."""
+"""Trusted Celery background execution."""

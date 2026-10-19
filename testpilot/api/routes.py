@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from .database import get_session
 from .repository import RunRepository, RunConflict, RunNotFound
 from .schemas import CreateRunRequest, HealthResponse, RunPage, RunResponse
+from testpilot.worker.celery_app import app as celery_app
 
 
 router = APIRouter()
@@ -46,12 +47,20 @@ def get_run(run_id: UUID, session: Session = Depends(get_session)):
 
 @router.post("/api/runs/{run_id}/execute", response_model=RunResponse, status_code=status.HTTP_202_ACCEPTED)
 def execute_existing_run(run_id: UUID, response: Response, session: Session = Depends(get_session)):
-    # Publication belongs to the outbox dispatcher, never a request process.
     try:
         record = RunRepository(session).queue(run_id)
-        response.headers["Location"] = f"/api/runs/{record.id}"
-        return record
     except RunNotFound:
         raise HTTPException(status_code=404, detail="Run not found")
     except RunConflict:
         raise HTTPException(status_code=409, detail="Run has already been started; automatic retries are disabled")
+    try:
+        # send_task does not execute eagerly in the API. The queue transaction
+        # has committed and released its connection before broker I/O.
+        celery_app.send_task("testpilot.execute_run", args=[str(record.id)],
+                             task_id=str(record.task_id), retry=False)
+    except Exception:
+        RunRepository(session).publication_failed(record.id, record.task_id)
+        raise HTTPException(status_code=503, detail="Task publication failed or acknowledgement was uncertain. "
+                            "Check the run status before creating a new run.") from None
+    response.headers["Location"] = f"/api/runs/{record.id}"
+    return record

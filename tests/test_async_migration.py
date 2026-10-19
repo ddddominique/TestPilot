@@ -28,7 +28,7 @@ def test_async_migration_preserves_records_and_downgrade_does_not_requeue(tmp_pa
             config = Config("alembic.ini")
             config.attributes["connection"] = connection
             command.stamp(config, "0002_run_lifecycle")
-            command.upgrade(config, "head")
+            command.upgrade(config, "0003_async_dispatch")
             upgraded = Table("test_runs", MetaData(), autoload_with=connection)
             rows = {UUID(str(row.id)): row for row in connection.execute(select(upgraded))}
             assert rows[pending].status == "PENDING" and rows[pending].task_id is None
@@ -38,6 +38,11 @@ def test_async_migration_preserves_records_and_downgrade_does_not_requeue(tmp_pa
             connection.execute(upgraded.update().where(upgraded.c.id == pending.hex).values(status="QUEUED", task_id=job_id.hex))
             outbox = Table("run_dispatches", MetaData(), autoload_with=connection)
             connection.execute(outbox.insert().values(run_id=pending.hex))
+            command.upgrade(config, "head")
+            from sqlalchemy import inspect
+            assert "run_dispatches" not in inspect(connection).get_table_names()
+            current = connection.execute(select(upgraded).where(upgraded.c.id == pending.hex)).one()
+            assert current.status == "QUEUED" and UUID(str(current.task_id)) == job_id
             command.downgrade(config, "0002_run_lifecycle")
             restored = Table("test_runs", MetaData(), autoload_with=connection)
             rows = {UUID(str(row.id)): row for row in connection.execute(select(restored))}

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from testpilot.github import GitHubClient
 
-from .db_models import RunDispatch, TestRunRecord
+from .db_models import TestRunRecord
 
 
 class RunNotFound(Exception):
@@ -39,7 +39,7 @@ class RunRepository:
         return self.session.get(TestRunRecord, run_id)
 
     def queue(self, run_id: UUID) -> TestRunRecord:
-        """Commit eligibility transition and durable dispatch intent together."""
+        """Reserve a stable task identity before the API publishes to Redis."""
         with self.session.begin():
             row = self.session.scalars(
                 update(TestRunRecord)
@@ -51,8 +51,19 @@ class RunRepository:
                 if self.session.get(TestRunRecord, run_id) is None:
                     raise RunNotFound()
                 raise RunConflict("Run has already been queued or started")
-            self.session.add(RunDispatch(run_id=run_id))
         return row
+
+    def publication_failed(self, run_id: UUID, task_id: UUID) -> None:
+        # An uncertain broker response may race a worker. Never overwrite a
+        # claimed or completed attempt; that worker owns its execution result.
+        with self.session.begin():
+            self.session.execute(update(TestRunRecord).where(
+                TestRunRecord.id == run_id, TestRunRecord.task_id == task_id,
+                TestRunRecord.status == "QUEUED",
+            ).values(status="FAILED", execution_outcome="INFRASTRUCTURE_ERROR",
+                     completed_at=func.now(), updated_at=func.now(),
+                     error_details="Task publication failed or acknowledgement was uncertain. "
+                     "No automatic retry; inspect run status and worker logs before creating a new run."))
 
     def claim(self, run_id: UUID, task_id: UUID) -> TestRunRecord:
         with self.session.begin():
