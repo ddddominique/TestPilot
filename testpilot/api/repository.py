@@ -3,12 +3,20 @@
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from testpilot.github import GitHubClient
 
 from .db_models import TestRunRecord
+
+
+class RunNotFound(Exception):
+    pass
+
+
+class RunConflict(Exception):
+    pass
 
 
 class RunRepository:
@@ -29,6 +37,32 @@ class RunRepository:
 
     def get(self, run_id: UUID) -> Optional[TestRunRecord]:
         return self.session.get(TestRunRecord, run_id)
+
+    def claim(self, run_id: UUID) -> TestRunRecord:
+        with self.session.begin():
+            row = self.session.scalars(
+                update(TestRunRecord)
+                .where(TestRunRecord.id == run_id, TestRunRecord.status == "PENDING")
+                .values(status="RUNNING", started_at=func.now(), updated_at=func.now())
+                .returning(TestRunRecord)
+            ).first()
+            if row is None:
+                if self.session.get(TestRunRecord, run_id) is None:
+                    raise RunNotFound()
+                raise RunConflict("Run has already been started")
+        return row
+
+    def finish(self, run_id: UUID, values: dict) -> TestRunRecord:
+        with self.session.begin():
+            row = self.session.scalars(
+                update(TestRunRecord)
+                .where(TestRunRecord.id == run_id, TestRunRecord.status == "RUNNING")
+                .values(**values, completed_at=func.now(), updated_at=func.now())
+                .returning(TestRunRecord)
+            ).first()
+            if row is None:
+                raise RunConflict("Run is no longer running")
+        return row
 
     def list(self, limit: int, offset: int) -> tuple[list[TestRunRecord], int]:
         rows = self.session.scalars(

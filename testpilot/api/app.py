@@ -10,9 +10,10 @@ from sqlalchemy.orm import sessionmaker
 
 from .database import create_database_engine, create_session_factory
 from .routes import router
+from testpilot.pipeline import PipelineService
 
 
-def create_app(database_url: Optional[str] = None, sessions: Optional[sessionmaker] = None) -> FastAPI:
+def create_app(database_url: Optional[str] = None, sessions: Optional[sessionmaker] = None, pipeline_factory=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         engine = None
@@ -28,6 +29,7 @@ def create_app(database_url: Optional[str] = None, sessions: Optional[sessionmak
                 engine.dispose()
 
     application = FastAPI(title="TestPilot API", version="0.1.0", lifespan=lifespan)
+    application.state.pipeline_factory = pipeline_factory or PipelineService
     application.include_router(router)
 
     @application.exception_handler(SQLAlchemyError)

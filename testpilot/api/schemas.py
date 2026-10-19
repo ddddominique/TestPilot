@@ -2,7 +2,7 @@
 
 import re
 from datetime import datetime
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -39,8 +39,17 @@ class RunResponse(BaseModel):
     repository: str
     pr_number: int
     head_sha: Optional[str]
-    status: Union[Literal["PENDING"], ExecutionStatus]
+    status: Literal["PENDING", "RUNNING", "COMPLETED", "FAILED"]
     framework: Optional[str]
+    execution_outcome: Optional[ExecutionStatus]
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+    exit_code: Optional[int]
+    duration_seconds: Optional[float]
+    generation_summary: Optional[str]
+    framework_selection: Optional[str]
+    framework_evidence: list[str]
+    warnings: list[str]
     passed: int
     failed: int
     skipped: int

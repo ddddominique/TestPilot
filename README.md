@@ -6,6 +6,7 @@ TestPilot is an AI-powered pull-request testing agent. It currently implements:
 - **Phase 2:** detect pytest, Jest, or Vitest and optionally use OpenAI Structured Outputs to produce validated test proposals.
 - **Phase 3:** opt-in execution of generated pytest modules against an exact PR head snapshot inside Docker.
 - **Phase 4.1:** a FastAPI REST API that persists pending runs in PostgreSQL.
+- **Phase 4.2:** explicit synchronous pipeline execution with persistent lifecycle and results.
 
 Without `--execute`, generated tests remain proposals only. Execution materializes them in temporary storage outside your project. TestPilot never modifies the target repository, creates commits, or posts PR comments. Webhooks and a frontend are not implemented.
 
@@ -227,7 +228,7 @@ The integration scenarios are skipped unless explicitly enabled and Docker plus 
 
 ## Phase 4.1 REST API and PostgreSQL
 
-The API stores run requests and history. `POST /api/runs` only creates a persistent `PENDING` record: it makes no GitHub HTTP request and does not start generation or execution. Runs remain pending until a future processing milestone. Existing CLI generation and Docker execution continue to work independently and are not automatically persisted by the API.
+The API stores run requests and history. `POST /api/runs` only creates a persistent `PENDING` record: it makes no GitHub HTTP request and does not start generation or execution. Phase 4.2 adds a separate explicit execute endpoint. The existing CLI uses the same pipeline service and remains independent of database persistence.
 
 From the project root, install the updated requirements and configure local development:
 
@@ -248,12 +249,13 @@ python -m alembic upgrade head
 python -m uvicorn testpilot.api.app:app --reload --host 127.0.0.1 --port 8000
 ```
 
-The database is PostgreSQL 17, bound only to `127.0.0.1:5432`, with a health check and named volume. `docker compose down` stops the local database while retaining its volume. Changing the Compose password does not change credentials in an already initialized PostgreSQL volume. The API requires `DATABASE_URL` using `postgresql+psycopg://...`; it does not load `.env` itself or create tables at startup. Alembic migrations must be applied before creating/listing runs. No OpenAI or GitHub credentials are required for these API operations. API documentation is available at `http://127.0.0.1:8000/docs`.
+The database is PostgreSQL 17, bound only to `127.0.0.1:5432`, with a health check and named volume. `docker compose down` stops the local database while retaining its volume. Changing the Compose password does not change credentials in an already initialized PostgreSQL volume. The API requires `DATABASE_URL` using `postgresql+psycopg://...`; it does not load `.env` itself or create tables at startup. Alembic migrations must be applied before creating/listing runs. Create/read operations need no OpenAI or GitHub credentials; execution needs `OPENAI_API_KEY`, optionally `GITHUB_TOKEN` and `OPENAI_MODEL`, and a trusted Docker runner. API documentation is available at `http://127.0.0.1:8000/docs`.
 
 | Endpoint | Behavior |
 | --- | --- |
 | `GET /health` | `200 {"status":"ok"}`; basic process liveness, not database readiness |
 | `POST /api/runs` | Accepts `{"pr_url":"https://github.com/owner/repo/pull/123"}`; returns `201` with the UUID, `PENDING` status, and run fields; includes a `Location` header |
+| `POST /api/runs/{run_id}/execute` | Synchronously executes a pending run and returns `200` with the final lifecycle and execution outcome; `404` if missing, `409` if already started |
 | `GET /api/runs/{run_id}` | Returns the run; unknown UUIDs return `404` |
 | `GET /api/runs?limit=20&offset=0` | Returns `{items,total,limit,offset}`, ordered by creation time descending with UUID tie-breaking |
 
@@ -273,11 +275,12 @@ API architecture:
 
 - `testpilot/api/app.py`: application factory, engine lifecycle, and sanitized database errors.
 - `database.py`: environment configuration, psycopg engine, and request-scoped sessions.
-- `db_models.py`: SQLAlchemy 2.x `test_runs` model with UUIDs, timezone-aware timestamps, JSONB generated-test metadata, nonnegative counts, and constrained statuses reusing the execution status vocabulary.
+- `db_models.py`: SQLAlchemy 2.x `test_runs` model with UUIDs, timezone-aware timestamps, JSONB generated-test metadata, nonnegative counts, lifecycle status, and a separate execution outcome using the existing execution status vocabulary.
 - `schemas.py`: Pydantic request/response models and PR URL validation.
-- `repository.py`: transactional create, lookup, and pagination operations.
+- `repository.py`: transactional create, lookup, pagination, atomic claim, and finalization operations.
+- `run_service.py`: short persistence transactions around the shared synchronous pipeline, plus bounded/sanitized stored results.
 - `routes.py`: HTTP routing, status codes, and pagination bounds.
-- `migrations/`: Alembic schema revisions. Initial migration: `0001_create_test_runs`.
+- `migrations/`: Alembic schema revisions. Initial migration: `0001_create_test_runs`; lifecycle migration: `0002_run_lifecycle`.
 
 Write transactions commit before returning HTTP 201; exceptions roll back. Sessions close after every request and the application disposes its engine on shutdown. `updated_at` is maintained on SQLAlchemy updates; direct SQL writers must update it explicitly. Head SHA, framework, output, and errors remain null on pending records, counts start at zero, and generated-test metadata starts as an empty JSON array.
 
@@ -301,4 +304,58 @@ python -m pytest -q tests/test_api_postgres.py
 
 That opt-in test creates a uniquely named temporary schema, applies the real Alembic migration, checks API persistence/JSONB/rollback, and drops only its temporary schema afterward. It requires schema-creation privileges and is skipped unless the test URL is provided.
 
-There is no authentication, authorization, background processing, frontend, or automatic execution yet. Keep this API on localhost for development. Offset-based pagination may shift between requests during concurrent inserts. `/health` does not verify that PostgreSQL is reachable or migrations are current.
+There is no authentication, authorization, background processing, frontend, or automatic execution on creation. Keep this API on localhost for development. Offset-based pagination may shift between requests during concurrent inserts. `/health` does not verify that PostgreSQL is reachable or migrations are current.
+
+## Phase 4.2: persistent pipeline execution
+
+`testpilot/pipeline.py` is the shared orchestrator for the CLI and API. It reuses GitHub retrieval, bounded context collection, framework selection/inference, structured test generation, and the hardened Docker executor. Component factories are injectable for offline tests. Partial metadata is retained when a stage fails. CLI options, formatting, and exit codes remain supported, including context-only and generation-only runs, `--framework`, and opt-in `--execute`.
+
+Lifecycle status and execution outcome are distinct:
+
+| Lifecycle | Meaning |
+| --- | --- |
+| `PENDING` | Created, not claimed |
+| `RUNNING` | Atomically claimed; pipeline underway |
+| `COMPLETED` | Attempt finished with a recorded execution outcome |
+| `FAILED` | Orchestration failed or the executor reported `INFRASTRUCTURE_ERROR` |
+
+For example, failing assertions are `COMPLETED` with `execution_outcome="TEST_FAILED"`. Collection, syntax, dependency, timeout, and unsupported outcomes also complete the attempt with their granular outcome. Cleanup/infrastructure failures yield `FAILED / INFRASTRUCTURE_ERROR`. A failure before execution can have a null execution outcome, with an allowlisted stage diagnostic instead of a raw exception. Pipeline completion does not imply that tests passed.
+
+Execution claims use a conditional SQL update from `PENDING` to `RUNNING`. Only one request can win. The claim commits and its session closes before any GitHub, LLM, or Docker work. A second short transaction stores the head SHA, framework selection/evidence, generated code, execution outcome, counts, output, diagnostics, and start/completion timestamps. No database connection remains checked out throughout pipeline execution. Repeated requests—including retries after a failed attempt—return 409; create a new run for a deliberate retry.
+
+Migration `0002_run_lifecycle` preserves existing pending rows and maps legacy terminal status values into lifecycle plus execution outcome. The original migration is unchanged. Legacy terminal timestamps are backfilled from the previous creation/update timestamps. Apply migrations to an existing Phase 4.1 database before starting this version:
+
+```bash
+python -m alembic upgrade head
+python -m testpilot.build_runner
+python -m uvicorn testpilot.api.app:app --host 127.0.0.1 --port 8000
+```
+
+With `DATABASE_URL`, `OPENAI_API_KEY`, and optionally `GITHUB_TOKEN`/`OPENAI_MODEL` exported, create and explicitly execute a real PR:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"pr_url":"https://github.com/ddddominique/Coding-Exercise/pull/1"}'
+# Copy the returned id into RUN_UUID below.
+curl -X POST http://127.0.0.1:8000/api/runs/RUN_UUID/execute
+curl http://127.0.0.1:8000/api/runs/RUN_UUID
+curl 'http://127.0.0.1:8000/api/runs?limit=10&offset=0'
+```
+
+The execute endpoint returns HTTP 200 when the attempt is recorded, even if tests fail or lifecycle is `FAILED`; inspect both status fields. Database errors return 503. Generation/execution remain explicit; only pytest executes and the existing sandbox/source-root/provenance controls remain in force.
+
+Stored generated-test metadata is limited to 20 proposals and 400 KB, with complete module code retained when it fits. Oversized metadata is omitted with a warning rather than saved as incomplete executable code. Output is capped at 64 KB, summaries/errors at 8 KB each, warnings at 64 entries of 2 KB, and evidence at 32 entries of 2 KB. No repository snapshot or collected source context is persisted. Configured API/database credentials and common token/header forms are redacted from stored text; sanitized code can differ from executed code and is flagged. Raw orchestration exception messages are not persisted. Redaction is best-effort for arbitrary secrets embedded in repository content; do not treat stored output as safe for public disclosure.
+
+### Development-only synchronous execution
+
+Execution blocks a request worker until the existing pipeline stages finish. Existing network and Docker timeouts apply, but there is no additional whole-request deadline or durable task supervisor. A client/proxy timeout does not guarantee cancellation. A server crash, forced reload, or failed final database commit can leave a record `RUNNING`; the latter returns 503 and does not permit duplicate execution. There is no automatic recovery or retry. Avoid server reloads while a run is executing. Phase 5 will introduce Redis/Celery job processing and address durable recovery, worker supervision, cancellation, and retry policy.
+
+```bash
+python -m pytest -q
+python -m pytest -q tests/test_pipeline.py tests/test_run_lifecycle.py tests/test_lifecycle_migration.py
+# Dedicated PostgreSQL test database only; applies both real migrations:
+TESTPILOT_TEST_DATABASE_URL="$DATABASE_URL" python -m pytest -q tests/test_api_postgres.py
+```
+
+Routine tests mock pipeline boundaries and exercise transactions/concurrency using an isolated SQLite database. PostgreSQL integration remains optional and is required to verify actual PostgreSQL behavior; neither a skipped integration test nor offline SQL generation establishes that a live migration passed.

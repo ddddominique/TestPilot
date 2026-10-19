@@ -4,14 +4,14 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, Index, Integer, JSON, String, Text, Uuid, func, text
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, Float, Index, Integer, JSON, String, Text, Uuid, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from testpilot.execution_models import ExecutionStatus
 
 
-RUN_STATUSES = ["PENDING", *(status.value for status in ExecutionStatus)]
+RUN_STATUSES = ["PENDING", "RUNNING", "COMPLETED", "FAILED"]
 
 
 class Base(DeclarativeBase):
@@ -28,6 +28,11 @@ class TestRunRecord(Base):
             "status IN (" + ", ".join(repr(value) for value in RUN_STATUSES) + ")",
             name="ck_test_runs_status",
         ),
+        CheckConstraint(
+            "execution_outcome IS NULL OR execution_outcome IN ("
+            + ", ".join(repr(status.value) for status in ExecutionStatus) + ")",
+            name="ck_test_runs_execution_outcome",
+        ),
         Index("ix_test_runs_created_at_id", "created_at", "id"),
     )
 
@@ -38,6 +43,15 @@ class TestRunRecord(Base):
     head_sha: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="PENDING", server_default="PENDING")
     framework: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    execution_outcome: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    exit_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    duration_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    generation_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    framework_selection: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    framework_evidence: Mapped[list] = mapped_column(JSON().with_variant(JSONB(), "postgresql"), default=list, server_default=text("'[]'"))
+    warnings: Mapped[list] = mapped_column(JSON().with_variant(JSONB(), "postgresql"), default=list, server_default=text("'[]'"))
     passed: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     failed: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     skipped: Mapped[int] = mapped_column(Integer, default=0, server_default="0")

@@ -1,12 +1,13 @@
-"""REST routes for persistent pending runs."""
+"""REST routes for persistent runs and explicit synchronous execution."""
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
 from .database import get_session
-from .repository import RunRepository
+from .repository import RunRepository, RunConflict, RunNotFound
+from .run_service import execute_run
 from .schemas import CreateRunRequest, HealthResponse, RunPage, RunResponse
 
 
@@ -42,3 +43,15 @@ def get_run(run_id: UUID, session: Session = Depends(get_session)):
     if record is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return record
+
+
+@router.post("/api/runs/{run_id}/execute", response_model=RunResponse)
+def execute_existing_run(run_id: UUID, request: Request):
+    # This route deliberately does not depend on get_session: only the claim
+    # and result writes own short sessions, never the network/LLM/Docker work.
+    try:
+        return execute_run(run_id, request.app.state.session_factory, request.app.state.pipeline_factory)
+    except RunNotFound:
+        raise HTTPException(status_code=404, detail="Run not found")
+    except RunConflict:
+        raise HTTPException(status_code=409, detail="Run has already been started; automatic retries are disabled")
