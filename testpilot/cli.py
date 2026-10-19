@@ -27,7 +27,10 @@ def format_summary(pr: PullRequest, context: CollectedContext) -> str:
         )
     lines.extend([
         "",
-        f"Collected context ({len(context.files)} files, {context.total_characters} characters):",
+        f"Budgeted context ({context.total_characters}/{context.max_characters} characters):",
+        f"  - PR metadata: {len(context.pr_title) + len(context.pr_description)} chars",
+        f"  - Patches: {len(context.patches)} files, {sum(len(item.content) for item in context.patches)} chars",
+        f"Collected repository context ({len(context.files)} files):",
     ])
     for item in context.files:
         suffix = ", truncated" if item.truncated else ""

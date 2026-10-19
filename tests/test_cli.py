@@ -9,10 +9,11 @@ def test_summary_is_readable_and_reports_omissions():
     )
     context = CollectedContext(
         [ContextFile("src/a.py", "source", "code")], ["src/a.py"], [], [],
-        ["tests/test_a.py"], ["one warning"],
+        ["tests/test_a.py"], ["one warning"], max_characters=100,
     )
     output = format_summary(pr, context)
     assert "a/b#2" in output
     assert "patch unavailable" in output
     assert "Omitted files (1)" in output
     assert "one warning" in output
+    assert "4/100 characters" in output

@@ -37,6 +37,13 @@ class ContextFile:
 
 
 @dataclass(frozen=True)
+class ContextPatch:
+    path: str
+    content: str
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
 class CollectedContext:
     files: list[ContextFile]
     relevant_source_files: list[str]
@@ -44,7 +51,16 @@ class CollectedContext:
     testing_config: list[str]
     omitted_files: list[str]
     warnings: list[str] = field(default_factory=list)
+    pr_title: str = ""
+    pr_description: str = ""
+    patches: list[ContextPatch] = field(default_factory=list)
+    max_characters: int = 0
 
     @property
     def total_characters(self) -> int:
-        return sum(len(item.content) for item in self.files)
+        return (
+            len(self.pr_title)
+            + len(self.pr_description)
+            + sum(len(item.content) for item in self.patches)
+            + sum(len(item.content) for item in self.files)
+        )
