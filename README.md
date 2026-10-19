@@ -8,6 +8,7 @@ TestPilot is an AI-powered pull-request testing agent. It currently implements:
 - **Phase 4.1:** a FastAPI REST API that persists pending runs in PostgreSQL.
 - **Phase 4.2:** explicit synchronous pipeline execution with persistent lifecycle and results.
 - **Phase 5:** asynchronous API execution via direct Redis publication and Celery workers (replaces synchronous HTTP execution).
+- **Phase 6:** a dark, responsive Next.js dashboard for submitting PRs, polling runs, and inspecting test evidence.
 
 Without `--execute`, generated tests remain proposals only. Execution materializes them in temporary storage outside your project. TestPilot never modifies the target repository, creates commits, or posts PR comments. Webhooks and a frontend are not implemented.
 
@@ -404,3 +405,62 @@ TESTPILOT_TEST_REDIS_URL=redis://127.0.0.1:6379/15 python -m pytest -q tests/tes
 ```
 
 Routine tests mock pipeline boundaries and exercise transactions/concurrency using an isolated SQLite database. PostgreSQL integration remains optional and is required to verify actual PostgreSQL behavior; neither a skipped integration test nor offline SQL generation establishes that a live migration passed.
+
+## Phase 6: frontend dashboard
+
+The `frontend/` app uses Next.js App Router, TypeScript, Tailwind CSS, and React state/effects—no authentication, UI framework, global state manager, or additional backend service. Use an up-to-date Node.js **22.16+** release with npm. The lockfile pins dependency versions; the production build explicitly uses Next.js's supported Webpack mode to avoid Turbopack build-subprocess port requirements in restricted environments.
+
+```bash
+# Keep PostgreSQL/Redis, FastAPI, and Celery running as described in Phase 5.
+# From the repository root, in another terminal:
+cd frontend
+cp .env.example .env.local
+npm ci
+npm run dev
+# Open http://localhost:3000
+```
+
+The default development setup is:
+
+- PostgreSQL + Redis: `docker compose up -d --wait postgres redis`.
+- Schema: activate the Python virtualenv, export backend `.env`, then `python -m alembic upgrade head`.
+- Trusted image (when first setting up/changing the runner): `python -m testpilot.build_runner`.
+- FastAPI terminal: `python -m uvicorn testpilot.api.app:app --host 127.0.0.1 --port 8000`.
+- Worker terminal with a **valid** `OPENAI_API_KEY`, optional valid `GITHUB_TOKEN`, `DATABASE_URL`, and `CELERY_BROKER_URL`: `python -m celery -A testpilot.worker.celery_app:app worker --pool=prefork --concurrency=1 --loglevel=INFO`.
+- Frontend terminal: `cd frontend && npm run dev`. Stop it with Ctrl-C.
+
+Remove placeholder GitHub tokens for public repositories; do not export example tokens as real credentials. Only the backend worker needs LLM/GitHub credentials. Never put them in `NEXT_PUBLIC_*`, frontend source, or committed files.
+
+### Request flow and structure
+
+`/` validates the GitHub PR URL, calls `POST /api/runs`, then `POST /api/runs/{id}/execute`, and navigates to `/runs/{id}`. It lists the ten latest runs using the existing paginated history endpoint. If queuing fails after creation, an error includes a link to inspect that run; submission is never retried automatically. If creating a run times out before an ID is received, check recent runs before submitting again.
+
+`/runs/[id]` calls `GET /api/runs/{id}`. It polls every 2.5 seconds **after the previous response finishes**, stops at `COMPLETED` or `FAILED`, and aborts requests/clears timers on navigation. Transient read errors show the last received data and retry; 404/422 errors stop polling. Fetches have a 15-second timeout. Read retries never enqueue or execute work.
+
+- `frontend/app/`: shared layout, overview, dynamic run page, and responsive dark styling.
+- `frontend/lib/api.ts`: FastAPI-aligned types, URL validation, typed request helpers, and readable network errors.
+- `frontend/lib/use-run.ts`: sequential polling and cancellation.
+- `frontend/components/`: reusable status and run-results views, including copyable code, source paths, diagnostics, framework evidence, and runner output.
+- `frontend/tests/`: mocked request, submission, result rendering, copy-code, and polling lifecycle tests.
+- `tests/test_frontend_contract.py`: compares frontend run field names and lifecycle/outcome vocabularies against the real FastAPI schemas.
+
+The browser requests `NEXT_PUBLIC_API_BASE_URL=/backend`. A simple Next.js rewrite proxies `/backend/*` to server-side `API_BASE_URL` (default `http://127.0.0.1:8000`). This keeps development same-origin without FastAPI CORS changes or duplicating business logic. Restart Next.js after changing these variables; public variables are embedded at build time. Setting a cross-origin browser base URL instead requires your own backend CORS configuration and is not the default setup.
+
+The UI distinguishes pipeline lifecycle from test results: `COMPLETED / TEST_FAILED` means the tests detected failures, not that the pipeline failed. `FAILED` is displayed separately. Stored `redacted_display` modules are explicitly labeled as modified display-only text. Hashes identify original generated source, not proof that it executed. Code and logs are rendered as escaped text, not HTML or executable browser code. Persisted omissions/truncation remain visible through warnings and runner text.
+
+### Frontend verification
+
+```bash
+cd frontend
+npm run lint
+npm run typecheck
+npm test
+npm run build
+npm start  # production build, localhost:3000
+# From repository root:
+python -m pytest -q
+```
+
+Tests use fixtures only in test files; the application never displays fake results. A production build does not need a running backend because data loads through the client API. The dashboard has no live stream or incremental pipeline persistence: generated modules and results appear when the backend saves them. History shows only the latest ten runs (manual refresh, no pagination UI). Stuck queued/running jobs retain Phase 5's documented failure windows; the frontend does not repair or rerun them. Keep all services local: there is still no authentication, and the proxy is not an authorization boundary. No webhook, OAuth, or frontend deployment infrastructure is included.
+
+Dependency audit at implementation time: `npm audit --omit=dev` reported zero production vulnerabilities. The full audit still reports five high-severity development-tool findings through `eslint-config-next` → `fast-glob` → `micromatch` → `braces`, with no compatible fix offered. Do not apply `npm audit fix --force` blindly (it proposes downgrading the Next.js lint configuration). Review upstream fixes and rerun the audit when updating dependencies; the development server is not intended for public exposure.
