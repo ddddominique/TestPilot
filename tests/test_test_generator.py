@@ -52,11 +52,21 @@ def test_context_formatter_is_deterministic_bounded_and_patch_first():
     second = format_generation_context(make_pr(), make_context(), detection, 2_000)
     assert first == second
     assert len(first) <= 2_000
+    assert first.index("ALLOWED TARGET SOURCE PATHS") < first.index("FRAMEWORK")
+    assert 'target_source_file must exactly equal one of these JSON strings' in first
+    assert '"src/parser.py"' in first
     assert first.index("PATCH path=src/parser.py") < first.index("category=config")
     assert "UNTRUSTED DATA" in first
     limited = format_generation_context(make_pr(), make_context(), detection, 450)
     assert len(limited) <= 450
     assert "TRUNCATED" in limited
+    assert '"src/parser.py"' in limited
+
+
+def test_allowed_target_list_is_never_silently_truncated():
+    detection = FrameworkDetection("python", "pytest", ["config"])
+    with pytest.raises(ValueError, match="complete allowed-target list.*at least"):
+        format_generation_context(make_pr(), make_context(), detection, 50)
 
 
 def test_generated_paths_reject_escape_absolute_and_sensitive_locations():
@@ -117,8 +127,10 @@ def test_unknown_target_framework_mismatch_and_oversized_output_are_rejected():
         client.chat.completions.parse.return_value = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(parsed=result, refusal=None))]
         )
-        with pytest.raises(TestGenerationError, match=message):
+        with pytest.raises(TestGenerationError, match=message) as error:
             TestGenerator(client=client).generate(make_pr(), make_context(), detection)
+        if "unknown source" in message:
+            assert "Allowed target paths: src/parser.py" in str(error.value)
 
     result = GenerationResult(summary="x" * 20, proposals=[], warnings=[])
     client = Mock()
@@ -129,3 +141,35 @@ def test_unknown_target_framework_mismatch_and_oversized_output_are_rejected():
         TestGenerator(client=client, max_output_characters=10).generate(
             make_pr(), make_context(), detection
         )
+
+
+def test_new_test_generator_module_is_accepted_when_listed_as_changed_source():
+    pr = PullRequest(
+        "acme", "widget", 2, "Add Phase 2", "", "base", "head",
+        [ChangedFile("testpilot/test_generator.py", "added", 10, 0, 10, "+code")],
+    )
+    context = CollectedContext(
+        [ContextFile("testpilot/test_generator.py", "source", "class TestGenerator: pass")],
+        ["testpilot/test_generator.py"], [], ["pyproject.toml"], [], [],
+        "Add Phase 2", "", [ContextPatch("testpilot/test_generator.py", "+code")], 10_000,
+    )
+    expected = GenerationResult(
+        summary="Add generator coverage",
+        proposals=[proposal(
+            path="tests/test_test_generator.py",
+            target="testpilot/test_generator.py",
+        )],
+        warnings=[],
+    )
+    client = Mock()
+    client.chat.completions.parse.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(parsed=expected, refusal=None))]
+    )
+
+    result = TestGenerator(client=client).generate(
+        pr, context, FrameworkDetection("python", "pytest", ["config"])
+    )
+
+    assert result.proposals[0].target_source_file == "testpilot/test_generator.py"
+    prompt = client.chat.completions.parse.call_args.kwargs["messages"][1]["content"]
+    assert '"testpilot/test_generator.py"' in prompt

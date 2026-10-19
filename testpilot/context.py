@@ -48,6 +48,23 @@ def _is_source(path: str) -> bool:
     return PurePosixPath(path).suffix.lower() in SOURCE_SUFFIXES and not _is_test(path)
 
 
+def _is_python_package_source(path: str, repository_tree: list[str]) -> bool:
+    """Resolve ambiguous ``test_*.py`` names inside importable packages as source.
+
+    Explicit test directories always win. This lets an application module such
+    as ``testpilot/test_generator.py`` remain source without weakening normal
+    pytest discovery conventions.
+    """
+    pure_path = PurePosixPath(path.lower())
+    if pure_path.suffix != ".py" or any(
+        part in {"test", "tests", "__tests__"} for part in pure_path.parts[:-1]
+    ):
+        return False
+    parent = str(pure_path.parent)
+    package_marker = "__init__.py" if parent == "." else f"{parent}/__init__.py"
+    return package_marker in {item.lower() for item in repository_tree}
+
+
 class ContextCollector:
     def __init__(
         self, client: GitHubClient, max_characters: int = 100_000, max_files: int = 30
@@ -72,12 +89,17 @@ class ContextCollector:
             warnings.append("Repository tree was incomplete; some tests or configuration may be absent.")
 
         changed = [item.filename for item in pull_request.files if item.status != "removed"]
-        sources = [path for path in changed if _is_source(path)]
-        changed_tests = [path for path in changed if _is_test(path)]
+        sources = [
+            path for path in changed
+            if _is_source(path) or _is_python_package_source(path, tree)
+        ]
+        changed_tests = [path for path in changed if _is_test(path) and path not in sources]
         stems = {PurePosixPath(path).stem.lower().removeprefix("test_") for path in sources}
         discovered_tests = [
             path for path in tree
-            if _is_test(path) and any(stem and stem in PurePosixPath(path).stem.lower() for stem in stems)
+            if path not in sources
+            and _is_test(path)
+            and any(stem and stem in PurePosixPath(path).stem.lower() for stem in stems)
         ]
         tests = list(dict.fromkeys(changed_tests + discovered_tests))
         configs = [path for path in tree if _is_config(path)]
