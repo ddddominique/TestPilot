@@ -1,0 +1,1 @@
+"""Trusted Celery background execution."""

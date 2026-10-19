@@ -1,7 +1,7 @@
 """Persistence operations only; no GitHub, LLM, or Docker calls."""
 
 from typing import Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
@@ -38,11 +38,38 @@ class RunRepository:
     def get(self, run_id: UUID) -> Optional[TestRunRecord]:
         return self.session.get(TestRunRecord, run_id)
 
-    def claim(self, run_id: UUID) -> TestRunRecord:
+    def queue(self, run_id: UUID) -> TestRunRecord:
+        """Reserve a stable task identity before the API publishes to Redis."""
         with self.session.begin():
             row = self.session.scalars(
                 update(TestRunRecord)
                 .where(TestRunRecord.id == run_id, TestRunRecord.status == "PENDING")
+                .values(status="QUEUED", queued_at=func.now(), task_id=uuid4(), updated_at=func.now())
+                .returning(TestRunRecord)
+            ).first()
+            if row is None:
+                if self.session.get(TestRunRecord, run_id) is None:
+                    raise RunNotFound()
+                raise RunConflict("Run has already been queued or started")
+        return row
+
+    def publication_failed(self, run_id: UUID, task_id: UUID) -> None:
+        # An uncertain broker response may race a worker. Never overwrite a
+        # claimed or completed attempt; that worker owns its execution result.
+        with self.session.begin():
+            self.session.execute(update(TestRunRecord).where(
+                TestRunRecord.id == run_id, TestRunRecord.task_id == task_id,
+                TestRunRecord.status == "QUEUED",
+            ).values(status="FAILED", execution_outcome="INFRASTRUCTURE_ERROR",
+                     completed_at=func.now(), updated_at=func.now(),
+                     error_details="Task publication failed or acknowledgement was uncertain. "
+                     "No automatic retry; inspect run status and worker logs before creating a new run."))
+
+    def claim(self, run_id: UUID, task_id: UUID) -> TestRunRecord:
+        with self.session.begin():
+            row = self.session.scalars(
+                update(TestRunRecord)
+                .where(TestRunRecord.id == run_id, TestRunRecord.status == "QUEUED", TestRunRecord.task_id == task_id)
                 .values(status="RUNNING", started_at=func.now(), updated_at=func.now())
                 .returning(TestRunRecord)
             ).first()

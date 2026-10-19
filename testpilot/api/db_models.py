@@ -11,7 +11,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from testpilot.execution_models import ExecutionStatus
 
 
-RUN_STATUSES = ["PENDING", "RUNNING", "COMPLETED", "FAILED"]
+RUN_STATUSES = ["PENDING", "QUEUED", "RUNNING", "COMPLETED", "FAILED"]
 
 
 class Base(DeclarativeBase):
@@ -44,6 +44,8 @@ class TestRunRecord(Base):
     status: Mapped[str] = mapped_column(String(32), default="PENDING", server_default="PENDING")
     framework: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     execution_outcome: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    queued_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    task_id: Mapped[Optional[UUID]] = mapped_column(Uuid, nullable=True, unique=True)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     exit_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)

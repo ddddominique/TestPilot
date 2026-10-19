@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import Column, CheckConstraint, DateTime, MetaData, String, Table, Uuid, create_engine, select
+from sqlalchemy import Column, CheckConstraint, DateTime, MetaData, String, Table, Text, Uuid, create_engine, select
 
 
 def test_new_migration_preserves_legacy_pending_and_execution_outcomes(tmp_path):
@@ -16,6 +16,7 @@ def test_new_migration_preserves_legacy_pending_and_execution_outcomes(tmp_path)
         "test_runs", metadata,
         Column("id", Uuid(), primary_key=True), Column("status", String(32), nullable=False),
         Column("created_at", DateTime(), nullable=False), Column("updated_at", DateTime(), nullable=False),
+        Column("error_details", Text),
         CheckConstraint("status IN ('PENDING', 'PASSED', 'TEST_FAILED', 'INFRASTRUCTURE_ERROR')", name="ck_test_runs_status"),
     )
     metadata.create_all(engine)

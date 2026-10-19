@@ -20,6 +20,7 @@ from testpilot.execution_models import ExecutionResult, ExecutionStatus
 from testpilot.generation_models import FrameworkDetection, GenerationResult, TestProposal
 from testpilot.models import PullRequest
 from testpilot.pipeline import PipelineError, PipelineResult
+from testpilot.worker.tasks import run_job
 
 
 URL = "https://github.com/a/b/pull/1"
@@ -76,11 +77,15 @@ def test_execute_persists_lifecycle_results_and_survives_restart(sessions, outco
 
     pipeline = Mock()
     pipeline.run.side_effect = run
-    with TestClient(create_app(sessions=sessions, pipeline_factory=lambda: pipeline)) as client:
+    with TestClient(create_app(sessions=sessions)) as client:
         pending = client.post("/api/runs", json={"pr_url": URL}).json()
         assert pending["status"] == "PENDING"
         assert calls == []
         response = client.post(f"/api/runs/{pending['id']}/execute")
+        assert response.status_code == 202
+        assert calls == []
+        run_job(pending["id"], response.json()["task_id"], sessions, lambda: pipeline)
+        response = client.get(f"/api/runs/{pending['id']}")
         assert response.status_code == 200
         saved = response.json()
         assert saved["status"] == lifecycle
@@ -107,9 +112,12 @@ def test_exception_persists_sanitized_failure_and_partial_metadata(sessions, mon
     partial.generation = partial.execution = None
     pipeline = Mock()
     pipeline.run.side_effect = PipelineError("generation", partial, RuntimeError("Authorization: Bearer sk-private-secret"))
-    with TestClient(create_app(sessions=sessions, pipeline_factory=lambda: pipeline)) as client:
+    with TestClient(create_app(sessions=sessions)) as client:
         identifier = client.post("/api/runs", json={"pr_url": URL}).json()["id"]
         response = client.post(f"/api/runs/{identifier}/execute")
+        assert response.status_code == 202
+        run_job(identifier, response.json()["task_id"], sessions, lambda: pipeline)
+        response = client.get(f"/api/runs/{identifier}")
         assert response.status_code == 200
         assert response.json()["status"] == "FAILED"
         assert response.json()["execution_outcome"] is None
@@ -121,7 +129,7 @@ def test_exception_persists_sanitized_failure_and_partial_metadata(sessions, mon
 
 def test_unknown_run_never_starts_pipeline(sessions):
     pipeline = Mock()
-    with TestClient(create_app(sessions=sessions, pipeline_factory=lambda: pipeline)) as client:
+    with TestClient(create_app(sessions=sessions)) as client:
         assert client.post(f"/api/runs/{uuid4()}/execute").status_code == 404
     pipeline.run.assert_not_called()
 
@@ -136,30 +144,35 @@ def test_concurrent_execute_requests_claim_run_once(sessions):
         return pipeline_result()
 
     pipeline.run.side_effect = run
-    with TestClient(create_app(sessions=sessions, pipeline_factory=lambda: pipeline)) as client:
+    with TestClient(create_app(sessions=sessions)) as client:
         identifier = client.post("/api/runs", json={"pr_url": URL}).json()["id"]
+        queued = client.post(f"/api/runs/{identifier}/execute")
+        assert queued.status_code == 202
         with ThreadPoolExecutor(max_workers=2) as pool:
-            first = pool.submit(client.post, f"/api/runs/{identifier}/execute")
+            first = pool.submit(run_job, identifier, queued.json()["task_id"], sessions, lambda: pipeline)
             try:
                 assert started.wait(5)
                 assert client.post(f"/api/runs/{identifier}/execute").status_code == 409
                 assert client.get(f"/api/runs/{identifier}").json()["status"] == "RUNNING"
             finally:
                 release.set()
-            assert first.result(timeout=5).json()["execution_outcome"] == "PASSED"
+            assert first.result(timeout=5) == "COMPLETED"
+            assert client.get(f"/api/runs/{identifier}").json()["execution_outcome"] == "PASSED"
     pipeline.run.assert_called_once()
 
 
 def test_simultaneous_database_claims_have_exactly_one_winner(sessions):
     with sessions() as session:
         identifier = RunRepository(session).create(URL).id
+    with sessions() as session:
+        task_id = RunRepository(session).queue(identifier).task_id
     barrier = Barrier(2)
 
     def claim():
         with sessions() as session:
             barrier.wait(timeout=5)
             try:
-                RunRepository(session).claim(identifier)
+                RunRepository(session).claim(identifier, task_id)
                 return "claimed"
             except RunConflict:
                 return "conflict"
@@ -171,7 +184,7 @@ def test_simultaneous_database_claims_have_exactly_one_winner(sessions):
 
 def test_claim_commit_failure_rolls_back_and_prevents_execution(sessions):
     pipeline = Mock()
-    with TestClient(create_app(sessions=sessions, pipeline_factory=lambda: pipeline)) as client:
+    with TestClient(create_app(sessions=sessions)) as client:
         identifier = client.post("/api/runs", json={"pr_url": URL}).json()["id"]
 
         def fail(session):
@@ -196,10 +209,12 @@ def test_final_commit_failure_leaves_running_and_does_not_allow_rerun(sessions):
 
     pipeline = Mock()
     pipeline.run.side_effect = run
-    with TestClient(create_app(sessions=sessions, pipeline_factory=lambda: pipeline)) as client:
+    with TestClient(create_app(sessions=sessions)) as client:
         identifier = client.post("/api/runs", json={"pr_url": URL}).json()["id"]
+        queued = client.post(f"/api/runs/{identifier}/execute")
         try:
-            assert client.post(f"/api/runs/{identifier}/execute").status_code == 503
+            with pytest.raises(SQLAlchemyError):
+                run_job(identifier, queued.json()["task_id"], sessions, lambda: pipeline)
         finally:
             event.remove(sessions.class_, "before_commit", fail)
         row = client.get(f"/api/runs/{identifier}").json()
@@ -328,9 +343,12 @@ def test_generic_factory_error_is_persisted_without_exposing_exception(sessions)
     def fail():
         raise RuntimeError("Authorization: Basic sensitive-credential-value")
 
-    with TestClient(create_app(sessions=sessions, pipeline_factory=fail)) as client:
+    with TestClient(create_app(sessions=sessions)) as client:
         identifier = client.post("/api/runs", json={"pr_url": URL}).json()["id"]
         response = client.post(f"/api/runs/{identifier}/execute")
+        assert response.status_code == 202
+        run_job(identifier, response.json()["task_id"], sessions, fail)
+        response = client.get(f"/api/runs/{identifier}")
         assert response.status_code == 200
         assert response.json()["status"] == "FAILED"
         assert "sensitive-credential-value" not in response.text

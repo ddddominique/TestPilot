@@ -18,13 +18,14 @@ from testpilot.execution_models import ExecutionResult, ExecutionStatus
 from testpilot.generation_models import FrameworkDetection, GenerationResult
 from testpilot.models import PullRequest
 from testpilot.pipeline import PipelineResult
+from testpilot.worker.tasks import run_job
 
 
 @pytest.mark.skipif(
     not os.getenv("TESTPILOT_TEST_DATABASE_URL"),
     reason="Set TESTPILOT_TEST_DATABASE_URL to a dedicated PostgreSQL test database",
 )
-def test_real_postgresql_migration_pending_run_jsonb_and_rollback():
+def test_real_postgresql_migration_pending_run_jsonb_and_rollback(broker):
     url = database_url(os.environ["TESTPILOT_TEST_DATABASE_URL"])
     schema = "testpilot_test_" + uuid4().hex
     admin = create_engine(url)
@@ -51,13 +52,17 @@ def test_real_postgresql_migration_pending_run_jsonb_and_rollback():
             generation=GenerationResult(summary="trusted fixture", proposals=[], warnings=[]),
             execution=ExecutionResult("a/b", 1, "a" * 40, "pytest", [], ExecutionStatus.PASSED, passed=1, exit_code=0),
         )
-        with TestClient(create_app(sessions=sessions, pipeline_factory=lambda: pipeline)) as client:
+        with TestClient(create_app(sessions=sessions)) as client:
             response = client.post("/api/runs", json={"pr_url": "https://github.com/a/b/pull/1"})
             assert response.status_code == 201
             record = response.json()
             assert record["status"] == "PENDING"
             assert client.get(f"/api/runs/{record['id']}").json() == record
             finished = client.post(f"/api/runs/{record['id']}/execute")
+            assert finished.status_code == 202
+            broker.assert_called_once()
+            run_job(record["id"], finished.json()["task_id"], sessions, lambda: pipeline)
+            finished = client.get(f"/api/runs/{record['id']}")
             assert finished.status_code == 200
             assert finished.json()["status"] == "COMPLETED"
             assert finished.json()["execution_outcome"] == "PASSED"
