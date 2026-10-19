@@ -35,6 +35,10 @@ def test_trusted_runner_classification(runner, monkeypatch, capsys, outcome, exp
                     message="ModuleNotFoundError: missing" if outcome == "dependency" else "bad collection"
                 )),
             ))
+            if outcome == "dependency":
+                plugin.pytest_exception_interact(None, SimpleNamespace(
+                    excinfo=SimpleNamespace(value=ModuleNotFoundError("No module named 'external_pkg'", name="external_pkg"))
+                ), SimpleNamespace(nodeid="test_fixture.py"))
             return 2
         if outcome == "empty":
             return 5
@@ -60,3 +64,33 @@ def test_runner_writer_bounds_output(runner):
     assert writer.size == 20
     assert writer.truncated
     assert writer.getvalue().startswith("x" * 20)
+
+
+def test_generic_import_error_is_not_classified_as_dependency(runner):
+    plugin = runner.ResultPlugin()
+    error = ImportError("cannot import name 'invented_function' from 'app'", name="app")
+    plugin.pytest_exception_interact(None, SimpleNamespace(excinfo=SimpleNamespace(value=error)),
+                                    SimpleNamespace(nodeid="test_generated.py::test_app"))
+    assert plugin.dependency_errors == 0
+    assert "invented_function" in plugin.import_diagnostics[0]
+    assert "test_generated.py::test_app" in plugin.import_diagnostics[0]
+
+
+def test_missing_project_submodule_preserves_project_diagnostic(runner, monkeypatch):
+    monkeypatch.setattr(runner.Path, "exists", lambda path: str(path) == "/workspace/repo/app")
+    plugin = runner.ResultPlugin()
+    error = ModuleNotFoundError("No module named 'app.invented'", name="app.invented")
+    plugin.pytest_exception_interact(None, SimpleNamespace(excinfo=SimpleNamespace(value=error)),
+                                    SimpleNamespace(nodeid="test_generated.py"))
+    assert plugin.dependency_errors == 0
+    assert "project module/import error" in plugin.import_diagnostics[0]
+    assert "app.invented" in plugin.import_diagnostics[0]
+
+
+def test_external_missing_module_keeps_generated_import_uncertainty(runner):
+    plugin = runner.ResultPlugin()
+    error = ModuleNotFoundError("No module named 'unavailable_pkg'", name="unavailable_pkg")
+    plugin.pytest_exception_interact(None, SimpleNamespace(excinfo=SimpleNamespace(value=error)),
+                                    SimpleNamespace(nodeid="test_generated.py"))
+    assert plugin.dependency_errors == 1
+    assert "dependency or incorrect generated import" in plugin.import_diagnostics[0]

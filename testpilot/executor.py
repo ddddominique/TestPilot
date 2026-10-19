@@ -2,8 +2,6 @@
 
 import ast
 import json
-import math
-import re
 import shutil
 import subprocess
 import threading
@@ -13,7 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .execution_models import ExecutionResult, ExecutionStatus
+from .execution_models import ExecutionResult, ExecutionStatus, validate_runner_payload
+from .build_runner import trusted_image_id
 from .generation_models import FrameworkDetection, GenerationResult
 from .models import PullRequest
 from .workspace import ExecutionWorkspace, WorkspaceError, WorkspaceManager
@@ -21,6 +20,15 @@ from .workspace import ExecutionWorkspace, WorkspaceError, WorkspaceManager
 
 DEFAULT_RUNNER_IMAGE = "testpilot-pytest-runner:0.1"
 RESULT_MARKER = "TESTPILOT_RESULT_JSON="
+
+
+def _unique_json_fields(pairs: list) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate field in runner JSON")
+        result[key] = value
+    return result
 
 
 @dataclass(frozen=True)
@@ -95,29 +103,37 @@ class DockerRunner:
         self._image_id: Optional[str] = None
 
     def check_available(self) -> Optional[str]:
+        self._image_id = None
         if shutil.which("docker") is None and isinstance(self.backend, BoundedCommandBackend):
             return "Docker CLI was not found. Install Docker and build the trusted TestPilot runner image."
         try:
             version = self.backend.run(["docker", "version", "--format", "{{.Server.Version}}"], 10, 4_096)
             if version.exit_code != 0:
                 return f"Docker daemon is unavailable: {version.output.strip()}"
+            expected_id = trusted_image_id()
             image = self.backend.run(
-                ["docker", "image", "inspect", "--format", "{{.Id}}", self.image], 10, 4_096
+                ["docker", "image", "inspect", "--format", "{{.Id}}", expected_id], 10, 4_096
             )
             if image.exit_code != 0:
                 return (
                     f"Trusted runner image {self.image!r} is missing. "
-                    "Build it with: docker build -t testpilot-pytest-runner:0.1 runner"
+                    "Build it with: python -m testpilot.build_runner"
                 )
             image_id = image.output.strip()
-            if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
-                return "Docker could not resolve the trusted runner to an immutable local image ID"
+            if image_id != expected_id:
+                return "Docker image does not match the trusted build record; rebuild the reviewed runner"
             self._image_id = image_id
+        except ValueError as exc:
+            return str(exc)
         except (OSError, CommandTimeout) as exc:
             return f"Docker is unavailable: {exc}"
         return None
 
     def run(self, workspace: ExecutionWorkspace) -> dict:
+        if self._image_id is None:
+            unavailable = self.check_available()
+            if unavailable:
+                raise OSError(unavailable)
         container_name = f"testpilot-{uuid.uuid4().hex[:12]}"
         test_paths = [
             f"/workspace/generated/{path.relative_to(workspace.generated).as_posix()}"
@@ -143,41 +159,54 @@ class DockerRunner:
             "--env", "PYTHONDONTWRITEBYTECODE=1",
             "--env", "PYTHONNOUSERSITE=1",
             "--env", "PYTHONSAFEPATH=1",
-            self._image_id or self.image,
+            self._image_id,
             *test_paths,
         ]
+        cleanup_warning = None
+        result = None
+        payload = None
         try:
             result = self.backend.run(command, self.timeout_seconds, self.max_output_bytes)
         except CommandTimeout as exc:
-            return {
+            payload = {
                 "status": ExecutionStatus.TIMEOUT.value,
                 "exit_code": None,
                 "passed": 0,
                 "failed": 0,
                 "skipped": 0,
                 "duration_seconds": exc.duration_seconds,
-                "output": exc.output,
+                "output": exc.output[:10_000],
                 "error": f"Execution exceeded {self.timeout_seconds:.0f} seconds",
                 "warnings": [],
             }
+        except OSError as exc:
+            payload = {
+                "status": "INFRASTRUCTURE_ERROR", "exit_code": None,
+                "passed": 0, "failed": 0, "skipped": 0, "duration_seconds": 0.0,
+                "output": "", "error": f"Docker startup failed: {exc}", "warnings": [],
+            }
         finally:
-            self._remove(container_name)
+            try:
+                self._remove(container_name)
+            except OSError as exc:
+                cleanup_warning = str(exc)
 
-        payload = self._parse_result(result.output)
-        if payload is None or result.exit_code != 0:
-            return {
+        if result is not None:
+            payload = self._parse_result(result.output)
+        if result is not None and (payload is None or result.exit_code != 0 or result.truncated):
+            payload = {
                 "status": ExecutionStatus.INFRASTRUCTURE_ERROR.value,
                 "exit_code": result.exit_code,
                 "passed": 0,
                 "failed": 0,
                 "skipped": 0,
                 "duration_seconds": result.duration_seconds,
-                "output": result.output,
+                "output": result.output[:10_000],
                 "error": "Trusted runner did not return structured results",
                 "warnings": ["Docker output was truncated"] if result.truncated else [],
             }
-        if result.truncated:
-            payload.setdefault("warnings", []).append("Docker output was truncated")
+        if cleanup_warning:
+            payload["warnings"].append(cleanup_warning)
         return payload
 
     def _remove(self, container_name: str) -> None:
@@ -190,13 +219,18 @@ class DockerRunner:
 
     @staticmethod
     def _parse_result(output: str) -> Optional[dict]:
+        if len(output.encode("utf-8")) > 100_000:
+            return None
         for line in reversed(output.splitlines()):
             if line.startswith(RESULT_MARKER):
                 try:
-                    payload = json.loads(line[len(RESULT_MARKER):])
-                except json.JSONDecodeError:
+                    payload = json.loads(line[len(RESULT_MARKER):], object_pairs_hook=_unique_json_fields)
+                except (ValueError, RecursionError):
                     return None
-                return payload if isinstance(payload, dict) else None
+                try:
+                    return validate_runner_payload(payload)
+                except (ValueError, TypeError, UnicodeError):
+                    return None
         return None
 
 
@@ -247,18 +281,13 @@ class TestExecutor:
                 error=str(exc),
             )
         try:
-            status = ExecutionStatus(payload.get("status"))
-            counts = [payload.get(name, 0) for name in ("passed", "failed", "skipped")]
-            if any(type(count) is not int or count < 0 for count in counts):
-                raise ValueError("invalid counts")
-            if status == ExecutionStatus.PASSED and (counts[0] == 0 or counts[1] != 0):
-                raise ValueError("no passing tests or inconsistent counts")
-            duration = float(payload.get("duration_seconds", 0.0))
-            if not math.isfinite(duration) or duration < 0:
-                raise ValueError("invalid duration")
-            if not isinstance(payload.get("warnings", []), list):
-                raise ValueError("invalid warnings")
-        except (ValueError, TypeError):
+            # DockerRunner may append one host-generated cleanup warning to
+            # the already validated 32-warning wire payload.
+            validate_runner_payload(payload, max_warnings=33)
+            status = ExecutionStatus(payload["status"])
+            counts = [payload[name] for name in ("passed", "failed", "skipped")]
+            duration = payload["duration_seconds"]
+        except (ValueError, TypeError, UnicodeError):
             status = ExecutionStatus.INFRASTRUCTURE_ERROR
             payload = {"error": "Runner returned invalid or inconsistent structured results"}
             counts = [0, 0, 0]

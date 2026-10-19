@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+from pathlib import Path
 import sys
 import time
 
@@ -44,21 +45,39 @@ class ResultPlugin:
         self.setup_errors = 0
         self.dependency_errors = 0
         self.teardown_errors = 0
+        self.import_diagnostics = []
 
     def pytest_collectreport(self, report) -> None:
         if report.failed:
             self.collection_errors += 1
-            self._check_dependency(report)
 
-    def _check_dependency(self, report) -> None:
-        crash = getattr(report.longrepr, "reprcrash", None)
-        message = getattr(crash, "message", "")
-        if "ModuleNotFoundError" in message or "ImportError" in message:
+    def pytest_exception_interact(self, node, call, report) -> None:
+        exception = call.excinfo.value
+        if not isinstance(exception, ImportError):
+            return
+        module = getattr(exception, "name", None)
+        project_module = False
+        if isinstance(module, str) and module:
+            root = module.split(".", 1)[0]
+            project_module = any(
+                (Path(base) / root).exists() or (Path(base) / f"{root}.py").exists()
+                for base in ("/workspace/repo", "/workspace/repo/src")
+            )
+        if isinstance(exception, ModuleNotFoundError) and module and not project_module:
             self.dependency_errors += 1
+            category = "missing module (dependency or incorrect generated import)"
+        elif project_module:
+            category = "project module/import error"
+        else:
+            category = "import error (check generated symbols and project imports)"
+        if len(self.import_diagnostics) < 8:
+            diagnostic = (
+                f"{getattr(report, 'nodeid', '?')}: {category}: "
+                f"{type(exception).__name__}: {exception}"
+            )
+            self.import_diagnostics.append(diagnostic[:450])
 
     def pytest_runtest_logreport(self, report) -> None:
-        if report.failed:
-            self._check_dependency(report)
         if report.when == "call":
             if report.passed:
                 self.passed += 1
@@ -101,7 +120,7 @@ def main() -> int:
         error = "No generated tests were collected."
     elif plugin.dependency_errors:
         status = "DEPENDENCY_ERROR"
-        error = "Import failed; check unavailable dependencies and generated import paths."
+        error = "A module could not be resolved. It may be an unavailable dependency or an incorrect generated import."
     elif plugin.collection_errors or plugin.setup_errors or plugin.teardown_errors or exit_code in {2, 3, 4}:
         status = "COLLECTION_ERROR"
         error = "Pytest could not collect or set up the generated tests."
@@ -114,6 +133,8 @@ def main() -> int:
     else:
         status = "COLLECTION_ERROR"
         error = "No tests passed (tests may all have been skipped), or pytest returned an unexpected result."
+    if plugin.import_diagnostics:
+        error = (error + "\n" + "\n".join(plugin.import_diagnostics)).encode("utf-8")[:4_000].decode("utf-8", errors="ignore")
     payload = {
         "status": status,
         "exit_code": exit_code,

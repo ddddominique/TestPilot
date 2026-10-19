@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import json
 
 import pytest
 
@@ -8,6 +9,11 @@ from testpilot.executor import BoundedCommandBackend, CommandResult, CommandTime
 from testpilot.generation_models import FrameworkDetection, GenerationResult, TestProposal
 from testpilot.models import PullRequest
 from testpilot.workspace import ExecutionWorkspace, WorkspaceError
+
+
+@pytest.fixture(autouse=True)
+def trusted_record(monkeypatch):
+    monkeypatch.setattr("testpilot.executor.trusted_image_id", lambda: "sha256:" + "a" * 64)
 
 
 def pr():
@@ -58,7 +64,7 @@ class FakeDocker:
     def __init__(self, payload=None, unavailable=None):
         self.payload = payload or {
             "status": "PASSED", "exit_code": 0, "passed": 1, "failed": 0,
-            "skipped": 0, "duration_seconds": 0.1, "output": "1 passed", "warnings": [],
+            "skipped": 0, "duration_seconds": 0.1, "output": "1 passed", "error": "", "warnings": [],
         }
         self.unavailable = unavailable
         self.ran = False
@@ -85,10 +91,12 @@ class FakeDocker:
 def test_maps_structured_docker_results_and_always_cleans_up(payload_status, expected):
     manager = FakeManager()
     docker = FakeDocker({
-        "status": payload_status, "exit_code": 0 if payload_status == "PASSED" else 1,
+        "status": payload_status,
+        "exit_code": None if payload_status == "TIMEOUT" else (0 if payload_status == "PASSED" else 1),
         "passed": 1 if payload_status == "PASSED" else 0,
         "failed": 0 if payload_status == "PASSED" else 1,
         "skipped": 0, "duration_seconds": 1.2, "output": "evidence", "warnings": [],
+        "error": "" if payload_status == "PASSED" else "fixture error",
     })
     result = TestExecutor(manager, docker).execute(
         pr(), FrameworkDetection("python", "pytest"), generation(proposal())
@@ -154,7 +162,7 @@ class FakeBackend:
         if command[:3] == ["docker", "version", "--format"]:
             return CommandResult(0, "25.0", 0.01)
         if command[:3] == ["docker", "image", "inspect"]:
-            return CommandResult(0, "[]", 0.01)
+            return CommandResult(0, "sha256:" + "a" * 64, 0.01)
         if command[:3] == ["docker", "run", "--name"]:
             if self.timeout:
                 raise CommandTimeout("partial", 2.0)
@@ -175,7 +183,7 @@ def docker_workspace(tmp_path):
 def test_docker_command_enforces_required_isolation_flags(tmp_path):
     payload = {
         "status": "PASSED", "exit_code": 0, "passed": 1, "failed": 0,
-        "skipped": 0, "duration_seconds": 0.1, "output": "ok", "warnings": [],
+        "skipped": 0, "duration_seconds": 0.1, "output": "ok", "error": "", "warnings": [],
     }
     backend = FakeBackend(CommandResult(0, "TESTPILOT_RESULT_JSON=" + __import__("json").dumps(payload), 0.2))
     runner = DockerRunner(backend=backend)
@@ -219,3 +227,124 @@ def test_invalid_runner_payload_fails_closed(payload):
         pr(), FrameworkDetection("python", "pytest"), generation(proposal())
     )
     assert result.status == ExecutionStatus.INFRASTRUCTURE_ERROR
+
+
+def valid_payload():
+    return {
+        "status": "PASSED", "exit_code": 0, "passed": 1, "failed": 0,
+        "skipped": 0, "duration_seconds": 0.1, "output": "ok", "error": "", "warnings": [],
+    }
+
+
+@pytest.mark.parametrize("timeout,status", [(True, "TIMEOUT"), (False, "TEST_FAILED")])
+@pytest.mark.parametrize("cleanup_failure", [OSError("daemon disconnected"), CommandTimeout("", 10)])
+def test_cleanup_failure_preserves_execution_outcome(tmp_path, timeout, status, cleanup_failure):
+    payload = dict(valid_payload(), status="TEST_FAILED", passed=0, failed=1, exit_code=1, error="assertion failed")
+
+    class BrokenCleanup(FakeBackend):
+        def run(self, command, timeout, max_output):
+            if command[:3] == ["docker", "rm", "-f"]:
+                self.commands.append(command)
+                raise cleanup_failure
+            return super().run(command, timeout, max_output)
+
+    backend = BrokenCleanup(CommandResult(0, "TESTPILOT_RESULT_JSON=" + json.dumps(payload), 0.1), timeout=timeout)
+    result = DockerRunner(backend=backend).run(docker_workspace(tmp_path))
+    assert result["status"] == status
+    container = next(cmd[3] for cmd in backend.commands if cmd[:3] == ["docker", "run", "--name"])
+    assert f"docker rm -f {container}" in result["warnings"][0]
+    assert result["error"] == ("Execution exceeded 60 seconds" if timeout else "assertion failed")
+
+
+def test_provenance_uses_recorded_id_instead_of_local_tag(tmp_path):
+    backend = FakeBackend(CommandResult(0, "TESTPILOT_RESULT_JSON=" + json.dumps(valid_payload()), 0.1))
+    runner = DockerRunner(backend=backend)
+    runner.run(docker_workspace(tmp_path))
+    inspected = next(cmd for cmd in backend.commands if cmd[:3] == ["docker", "image", "inspect"])
+    assert inspected[-1] == "sha256:" + "a" * 64
+    executed = next(cmd for cmd in backend.commands if cmd[:2] == ["docker", "run"])
+    assert "sha256:" + "a" * 64 in executed
+    assert "testpilot-pytest-runner:0.1" not in executed
+
+
+def test_unexpected_image_id_is_rejected():
+    class UnexpectedImage(FakeBackend):
+        def run(self, command, timeout, max_output):
+            if command[:3] == ["docker", "image", "inspect"]:
+                return CommandResult(0, "sha256:" + "b" * 64, 0.1)
+            return super().run(command, timeout, max_output)
+
+    assert "does not match" in DockerRunner(backend=UnexpectedImage()).check_available()
+
+
+@pytest.mark.parametrize("updates", [
+    {"exit_code": True}, {"exit_code": "0"}, {"passed": True},
+    {"duration_seconds": "0.1"}, {"duration_seconds": float("nan")},
+    {"duration_seconds": 10 ** 1000},
+    {"output": []}, {"output": "x" * 64_001}, {"error": None},
+    {"warnings": [5]}, {"warnings": "warning"}, {"warnings": ["x" * 2001]},
+    {"status": "TEST_FAILED", "exit_code": 1, "failed": 0, "error": "failure"},
+    {"status": "PASSED", "exit_code": 1}, {"status": "PASSED", "failed": 1},
+    {"status": "COLLECTION_ERROR", "exit_code": 5, "error": "empty", "passed": 1},
+])
+def test_complete_payload_validation_rejects_invalid_fields(updates):
+    payload = dict(valid_payload(), **updates)
+    result = TestExecutor(FakeManager(), FakeDocker(payload)).execute(
+        pr(), FrameworkDetection("python", "pytest"), generation(proposal())
+    )
+    assert result.status == ExecutionStatus.INFRASTRUCTURE_ERROR
+
+
+@pytest.mark.parametrize("missing", list(valid_payload()))
+def test_every_payload_field_is_required(missing):
+    payload = valid_payload()
+    del payload[missing]
+    result = TestExecutor(FakeManager(), FakeDocker(payload)).execute(
+        pr(), FrameworkDetection("python", "pytest"), generation(proposal())
+    )
+    assert result.status == ExecutionStatus.INFRASTRUCTURE_ERROR
+
+
+def test_malformed_and_oversized_wire_results_are_rejected():
+    assert DockerRunner._parse_result("TESTPILOT_RESULT_JSON={invalid") is None
+    assert DockerRunner._parse_result("x" * 100_001) is None
+    assert DockerRunner._parse_result('TESTPILOT_RESULT_JSON={"status":"PASSED","status":"TEST_FAILED"}') is None
+
+
+def test_passed_result_with_full_warning_list_survives_nonzero_cleanup(tmp_path):
+    payload = dict(valid_payload(), warnings=["fixture warning"] * 32)
+
+    class FailedRemoval(FakeBackend):
+        def run(self, command, timeout, max_output):
+            if command[:3] == ["docker", "rm", "-f"]:
+                self.commands.append(command)
+                return CommandResult(1, "permission denied", 0.1)
+            return super().run(command, timeout, max_output)
+
+    backend = FailedRemoval(CommandResult(0, "TESTPILOT_RESULT_JSON=" + json.dumps(payload), 0.1))
+    runner = DockerRunner(backend=backend)
+    workspace = docker_workspace(tmp_path)
+
+    class Manager:
+        def prepare(self, *args):
+            return workspace
+
+    result = TestExecutor(Manager(), runner).execute(
+        pr(), FrameworkDetection("python", "pytest"), generation(proposal())
+    )
+    assert result.status == ExecutionStatus.PASSED
+    assert result.passed == 1
+    assert len(result.warnings) == 33
+    assert "docker rm -f testpilot-" in result.warnings[-1]
+
+
+def test_missing_provenance_prevents_docker_run(tmp_path, monkeypatch):
+    def missing_record():
+        raise ValueError("Runner provenance missing; python -m testpilot.build_runner")
+
+    monkeypatch.setattr("testpilot.executor.trusted_image_id", missing_record)
+    backend = FakeBackend()
+    runner = DockerRunner(backend=backend)
+    with pytest.raises(OSError, match="provenance missing"):
+        runner.run(docker_workspace(tmp_path))
+    assert not any(cmd[:2] == ["docker", "run"] for cmd in backend.commands)

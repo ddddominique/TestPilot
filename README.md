@@ -132,11 +132,15 @@ python -m pytest -q
 Install Docker Desktop or Docker Engine and start its daemon. Build the trusted runner from this repository before first execution:
 
 ```bash
-docker build -t testpilot-pytest-runner:0.1 runner
+python -m testpilot.build_runner
 python main.py --pr https://github.com/owner/repo/pull/123 --generate-tests --execute
 ```
 
-`--execute` requires `--generate-tests`. The runner uses Python 3.12.8 and pytest 8.3.5, with pytest's dependencies and Python's standard library. The base image has a version tag; it is not pinned to a published registry digest. At execution time TestPilot resolves the locally built runner to its immutable image ID and uses `--pull never`. Build only the provided trusted Dockerfile; target repositories cannot supply an image or commands. Image building may access package registries; test containers have no networking.
+`--execute` requires `--generate-tests`. The runner uses Python 3.12.8 and pytest 8.3.5, with pytest's dependencies and Python's standard library. The Dockerfile pins the official Python multi-platform manifest to `sha256:2199a62885a12290dc9c5be3ca0681d367576ab7bf037da120e564723292a2f0`. This digest was verified against Docker Hub's registry by comparing the response's `Docker-Content-Digest` with SHA-256 of the retrieved manifest bytes for `library/python:3.12.8-slim-bookworm`.
+
+Review `runner/Dockerfile` and `runner/pytest_runner.py`, then run the build module above. It copies only those two files into a temporary build context, invokes Docker with `--iidfile`, and records the returned immutable image ID together with a hash of both reviewed source files in `.testpilot/runner-image.json` (gitignored). Execution verifies the record and current source hash, inspects the recorded image ID, and runs exactly that ID with `--pull never`. Retagging another local image does not change the image selected. Missing, invalid, or stale records fail closed and require rebuilding. A direct `docker build` alone does not establish this trust record.
+
+This is local build provenance: the host, Docker daemon, reviewed checkout, build dependencies, and trust record must be trusted. A user able to modify the trust record or Docker daemon can replace that trust. The record is not a cryptographic publisher signature. Build-time package registries remain a supply-chain dependency; test containers have no networking.
 
 Execution flow:
 
@@ -144,7 +148,9 @@ Execution flow:
 2. Tests are syntax checked and created exclusively in a separate temporary directory. Existing snapshot paths, unsafe paths, symlink traversal, and duplicate proposal paths are rejected. Snapshot and test mounts are read-only.
 3. `executor.py` starts the trusted image with a fixed command, no network, UID/GID 65532, all capabilities dropped, `no-new-privileges`, a read-only root filesystem, 512 MB memory, one CPU, 64 processes, and a 64 MB temporary filesystem. No credentials, Docker socket, or host project directory are mounted. The default deadline is 60 seconds, followed by forced container removal. Docker log storage is disabled and host output capture is bounded to 100 KB.
 4. `runner/pytest_runner.py` runs only the explicit generated paths. It disables repository configuration, `conftest.py`, and automatic plugin loading. Python starts in isolated mode before the runner adds the snapshot and its `src/` directory to the import path. No setup scripts or dependency installation run.
-5. `execution_models.py` carries status, commit, files, counts, duration, output, and errors back to the CLI. Temporary workspaces and containers are cleaned up on completion or failure.
+5. `execution_models.py` validates every required payload field without coercion, enforces bounded output/diagnostics, and checks status/count/exit-code consistency. Malformed, missing, oversized, truncated, or inconsistent reports fail as infrastructure errors. It carries status, commit, files, counts, duration, output, and errors back to the CLI.
+
+Container cleanup is always attempted. If removal fails, the original timeout or test outcome is preserved and a warning names the container and gives `docker rm -f <container-name>` for recovery. Check that warning even after passing tests; an incomplete removal may leave the restricted container running. Temporary workspace cleanup is still attempted.
 
 Example report:
 
@@ -162,7 +168,7 @@ Details: One or more generated tests failed. This may indicate a regression or a
 
 Statuses include `PASSED`, `TEST_FAILED`, `COLLECTION_ERROR`, `SYNTAX_ERROR`, `DEPENDENCY_ERROR`, `TIMEOUT`, `INFRASTRUCTURE_ERROR`, and `UNSUPPORTED`. Jest/Vitest execution is unsupported, while generation still works. Zero proposals, zero collected tests, and all-skipped runs are not reported as passed. CLI exit code is 0 for successful execution and 1 for unsuccessful execution; invalid CLI flag combinations exit 2.
 
-Missing imports produce `DEPENDENCY_ERROR`, which can mean an unavailable package or an incorrect generated import. No dependencies are installed from repository declarations. Repositories requiring packages beyond the trusted image will need a separately reviewed runner image in a future phase. Existing fixtures and repository plugins are deliberately unavailable unless the generated module itself imports code.
+Import classification uses the exception type and missing module name, not matches in printed text. A `ModuleNotFoundError` whose top-level module is absent from both snapshot import roots produces `DEPENDENCY_ERROR`, with an explicit warning that a generated import may be incorrect. A missing submodule of a known project module, or a generic `ImportError` such as an invented imported function, retains collection/test failure classification. Diagnostics include the test node, exception type, and original import message. A completely absent project module cannot always be distinguished from an external dependency; review the evidence. No dependencies are installed from repository declarations. Existing fixtures and repository plugins are deliberately unavailable unless the generated module itself imports code.
 
 Docker reduces risk but is not a perfect security boundary. This is a local development MVP, not a production multi-tenant sandbox. Untrusted tests execute in the same Python process as pytest and can interfere with reporting; results are evidence for review, not tamper-proof attestations. GitHub snapshots omit submodule contents and do not hydrate Git LFS. The archive is selected by immutable SHA through GitHub's API, not independently verified against a Git object database. Generated modules run under Python 3.12 in the container even if the host uses another version.
 
@@ -177,7 +183,7 @@ python -m pytest -q
 The optional integration test prepares a trusted archive containing an `add()` function, verifies immutable SHA selection, materializes a complete generated module, and runs two scenarios: `add(1, 2) == 3` passes and `add(1, 2) == 99` fails. It prints structured reports and requires no live GitHub PR or OpenAI request:
 
 ```bash
-docker build -t testpilot-pytest-runner:0.1 runner
+python -m testpilot.build_runner
 TESTPILOT_DOCKER_INTEGRATION=1 python -m pytest -q -s tests/test_docker_integration.py
 ```
 
