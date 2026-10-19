@@ -4,6 +4,7 @@ import base64
 import binascii
 import os
 import re
+from pathlib import Path
 from typing import Any, Iterator, Optional
 
 import requests
@@ -144,6 +145,13 @@ class GitHubClient:
         body = data.get("body")
         if body is not None and not isinstance(body, str):
             raise GitHubAPIError("Malformed pull request response: invalid body")
+        head_repo = data.get("head", {}).get("repo")
+        head_owner: Optional[str] = None
+        head_repository: Optional[str] = None
+        if isinstance(head_repo, dict):
+            full_name = head_repo.get("full_name")
+            if isinstance(full_name, str) and full_name.count("/") == 1:
+                head_owner, head_repository = full_name.split("/", 1)
         file_data = list(self._paginate(f"{root}/pulls/{number}/files"))
         warnings: list[str] = []
         files: list[ChangedFile] = []
@@ -186,7 +194,54 @@ class GitHubClient:
             head_sha=head_sha,
             files=files,
             warnings=warnings,
+            head_owner=head_owner,
+            head_repository=head_repository,
         )
+
+    def download_archive(
+        self,
+        owner: str,
+        repository: str,
+        sha: str,
+        destination: Path,
+        max_bytes: int = 100_000_000,
+    ) -> int:
+        """Stream an exact-commit GitHub tarball to a bounded local file."""
+        url = f"{API_ROOT}/repos/{owner}/{repository}/tarball/{sha}"
+        try:
+            response = self.session.get(
+                url, headers=self.headers, timeout=self.timeout, stream=True
+            )
+        except requests.RequestException as exc:
+            raise GitHubAPIError(f"Could not download PR snapshot: {exc}") from exc
+        if response.status_code >= 400:
+            response.close()
+            raise GitHubAPIError(
+                f"GitHub snapshot download returned {response.status_code}",
+                response.status_code,
+            )
+        content_length = response.headers.get("Content-Length")
+        if content_length and content_length.isdigit() and int(content_length) > max_bytes:
+            response.close()
+            raise GitHubAPIError(f"Repository snapshot exceeds the {max_bytes}-byte limit")
+        written = 0
+        try:
+            with destination.open("xb") as archive:
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > max_bytes:
+                        raise GitHubAPIError(
+                            f"Repository snapshot exceeds the {max_bytes}-byte limit"
+                        )
+                    archive.write(chunk)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+        finally:
+            response.close()
+        return written
 
     def get_tree(self, owner: str, repository: str, sha: str) -> tuple[list[str], bool]:
         payload = self._get(

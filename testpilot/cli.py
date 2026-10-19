@@ -7,11 +7,14 @@ import sys
 from typing import Sequence
 
 from .context import ContextCollector
+from .execution_models import ExecutionResult, ExecutionStatus
+from .executor import DockerRunner, TestExecutor
 from .framework_detector import detect_framework
 from .generation_models import FrameworkDetection, GenerationResult
 from .github import GitHubClient, GitHubError
 from .models import CollectedContext, PullRequest
 from .test_generator import TestGenerationError, TestGenerator
+from .workspace import WorkspaceManager
 
 
 def format_summary(pr: PullRequest, context: CollectedContext) -> str:
@@ -57,6 +60,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use OpenAI to produce structured test proposals without writing or executing them",
     )
     parser.add_argument("--max-llm-input-chars", type=int, default=100_000)
+    parser.add_argument(
+        "--execute", action="store_true",
+        help="Run generated pytest proposals in the restricted Docker runner",
+    )
     return parser
 
 
@@ -91,8 +98,40 @@ def format_generation_summary(
     return "\n".join(lines)
 
 
+def format_execution_summary(result: ExecutionResult) -> str:
+    lines = [
+        "",
+        "Execution results:",
+        f"Repository: {result.repository}#{result.pr_number}",
+        f"Head commit: {result.head_sha}",
+        f"Framework: {result.framework}",
+        f"Docker execution started: {'yes' if result.docker_started else 'no'}",
+        f"Generated test files: {', '.join(result.test_files) or '(none)'}",
+        f"Overall status: {result.status.value}",
+        f"Tests: {result.passed} passed, {result.failed} failed, {result.skipped} skipped",
+        f"Duration: {result.duration_seconds:.2f}s",
+    ]
+    if result.exit_code is not None:
+        lines.append(f"Exit code: {result.exit_code}")
+    if result.error:
+        lines.append(f"Details: {result.error}")
+    if result.output:
+        lines.extend(["Bounded runner output:", result.output.rstrip()])
+    if result.warnings:
+        lines.append("Execution warnings:")
+        lines.extend(f"  - {warning}" for warning in result.warnings)
+    if result.status == ExecutionStatus.TEST_FAILED:
+        lines.append(
+            "A failure may indicate a PR regression or an incorrect generated test; review the evidence."
+        )
+    return "\n".join(lines)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.execute and not args.generate_tests:
+        parser.error("--execute requires --generate-tests")
     try:
         client = GitHubClient()
         pull_request = client.get_pull_request(args.pr)
@@ -105,6 +144,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 pull_request, context, detection
             )
             print(format_generation_summary(detection, result))
+            if args.execute:
+                execution = TestExecutor(
+                    WorkspaceManager(client), DockerRunner()
+                ).execute(pull_request, detection, result)
+                print(format_execution_summary(execution))
+                return 0 if execution.successful else 1
             return 0
     except (GitHubError, TestGenerationError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

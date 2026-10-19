@@ -4,8 +4,9 @@ TestPilot is an AI-powered pull-request testing agent. It currently implements:
 
 - **Phase 1:** retrieve GitHub PR metadata, changed files, patches, and bounded repository context.
 - **Phase 2:** detect pytest, Jest, or Vitest and optionally use OpenAI Structured Outputs to produce validated test proposals.
+- **Phase 3:** opt-in execution of generated pytest modules against an exact PR head snapshot inside Docker.
 
-Generated tests are proposals only. TestPilot does not execute them, write them to the repository, create commits, or post PR comments. Phase 3 execution, webhooks, and a frontend are not implemented.
+Without `--execute`, generated tests remain proposals only. Execution materializes them in temporary storage outside your project. TestPilot never modifies the target repository, creates commits, or posts PR comments. Webhooks and a frontend are not implemented.
 
 ## Setup
 
@@ -120,8 +121,64 @@ python -m pytest -q
 - Framework detection is evidence-based but intentionally conservative; custom runners and unusual configuration may return `unknown`.
 - Generated proposals are schema- and path-validated but have not been compiled, executed, or checked against a live repository checkout.
 - Python proposals receive syntax-only validation using the Python version running TestPilot. JavaScript and TypeScript are not syntax-validated because no JS/TS parser is included.
-- Repository-relative string validation is not a filesystem containment guarantee. Phase 3 must perform real-path and symlink containment checks before writing or executing anything.
+- Repository-relative string validation alone is not a filesystem containment guarantee. Phase 3 also checks resolved paths and rejects archive symlinks before materialization.
 - Overwrite detection uses the GitHub tree returned in Phase 1. If GitHub truncates that tree, only known paths can be rejected.
 - Structured outputs reduce malformed responses but cannot guarantee that proposed test logic is correct or non-duplicative.
 - Fair sharing prevents starvation but may truncate several inputs instead of preserving one large input in full.
 - Unauthenticated GitHub API access has a low hourly rate limit; set `GITHUB_TOKEN` when needed.
+
+## Phase 3: opt-in Docker execution
+
+Install Docker Desktop or Docker Engine and start its daemon. Build the trusted runner from this repository before first execution:
+
+```bash
+docker build -t testpilot-pytest-runner:0.1 runner
+python main.py --pr https://github.com/owner/repo/pull/123 --generate-tests --execute
+```
+
+`--execute` requires `--generate-tests`. The runner uses Python 3.12.8 and pytest 8.3.5, with pytest's dependencies and Python's standard library. The base image has a version tag; it is not pinned to a published registry digest. At execution time TestPilot resolves the locally built runner to its immutable image ID and uses `--pull never`. Build only the provided trusted Dockerfile; target repositories cannot supply an image or commands. Image building may access package registries; test containers have no networking.
+
+Execution flow:
+
+1. `workspace.py` downloads the GitHub tarball using the full PR head SHA and fork repository metadata when available. Downloads are capped at 100 MB; extraction is capped at 250 MB and 20,000 entries. It rejects traversal, links, special files, sensitive directories, and duplicate files.
+2. Tests are syntax checked and created exclusively in a separate temporary directory. Existing snapshot paths, unsafe paths, symlink traversal, and duplicate proposal paths are rejected. Snapshot and test mounts are read-only.
+3. `executor.py` starts the trusted image with a fixed command, no network, UID/GID 65532, all capabilities dropped, `no-new-privileges`, a read-only root filesystem, 512 MB memory, one CPU, 64 processes, and a 64 MB temporary filesystem. No credentials, Docker socket, or host project directory are mounted. The default deadline is 60 seconds, followed by forced container removal. Docker log storage is disabled and host output capture is bounded to 100 KB.
+4. `runner/pytest_runner.py` runs only the explicit generated paths. It disables repository configuration, `conftest.py`, and automatic plugin loading. Python starts in isolated mode before the runner adds the snapshot and its `src/` directory to the import path. No setup scripts or dependency installation run.
+5. `execution_models.py` carries status, commit, files, counts, duration, output, and errors back to the CLI. Temporary workspaces and containers are cleaned up on completion or failure.
+
+Example report:
+
+```text
+Execution results:
+Repository: owner/repo#123
+Head commit: <40-character head SHA>
+Framework: pytest
+Docker execution started: yes
+Generated test files: tests/test_add_generated.py
+Overall status: TEST_FAILED
+Tests: 0 passed, 1 failed, 0 skipped
+Details: One or more generated tests failed. This may indicate a regression or an incorrect generated test.
+```
+
+Statuses include `PASSED`, `TEST_FAILED`, `COLLECTION_ERROR`, `SYNTAX_ERROR`, `DEPENDENCY_ERROR`, `TIMEOUT`, `INFRASTRUCTURE_ERROR`, and `UNSUPPORTED`. Jest/Vitest execution is unsupported, while generation still works. Zero proposals, zero collected tests, and all-skipped runs are not reported as passed. CLI exit code is 0 for successful execution and 1 for unsuccessful execution; invalid CLI flag combinations exit 2.
+
+Missing imports produce `DEPENDENCY_ERROR`, which can mean an unavailable package or an incorrect generated import. No dependencies are installed from repository declarations. Repositories requiring packages beyond the trusted image will need a separately reviewed runner image in a future phase. Existing fixtures and repository plugins are deliberately unavailable unless the generated module itself imports code.
+
+Docker reduces risk but is not a perfect security boundary. This is a local development MVP, not a production multi-tenant sandbox. Untrusted tests execute in the same Python process as pytest and can interfere with reporting; results are evidence for review, not tamper-proof attestations. GitHub snapshots omit submodule contents and do not hydrate Git LFS. The archive is selected by immutable SHA through GitHub's API, not independently verified against a Git object database. Generated modules run under Python 3.12 in the container even if the host uses another version.
+
+## Optional Docker fixture demonstration
+
+Normal unit tests mock GitHub, OpenAI, and Docker, and require no daemon or credentials:
+
+```bash
+python -m pytest -q
+```
+
+The optional integration test prepares a trusted archive containing an `add()` function, verifies immutable SHA selection, materializes a complete generated module, and runs two scenarios: `add(1, 2) == 3` passes and `add(1, 2) == 99` fails. It prints structured reports and requires no live GitHub PR or OpenAI request:
+
+```bash
+docker build -t testpilot-pytest-runner:0.1 runner
+TESTPILOT_DOCKER_INTEGRATION=1 python -m pytest -q -s tests/test_docker_integration.py
+```
+
+The integration scenarios are skipped unless explicitly enabled and Docker plus the runner image are available. A skipped test does not demonstrate container execution.

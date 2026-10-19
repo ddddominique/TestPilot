@@ -144,3 +144,41 @@ def test_patch_count_mismatch_reports_uncertain_completeness():
     session.get.side_effect = [response(pr), response(files)]
     result = GitHubClient(session=session).get_pull_request("https://github.com/a/b/pull/1")
     assert any("may be incomplete" in warning for warning in result.warnings)
+
+
+def test_pull_request_records_fork_head_repository():
+    session = Mock()
+    pr = {
+        "title": "x", "body": "", "base": {"sha": "base"},
+        "head": {"sha": "head", "repo": {"full_name": "fork-owner/fork-repo"}},
+    }
+    session.get.side_effect = [response(pr), response([])]
+    result = GitHubClient(session=session).get_pull_request("https://github.com/a/b/pull/1")
+    assert (result.head_owner, result.head_repository) == ("fork-owner", "fork-repo")
+
+
+def test_archive_download_is_streamed_and_bounded(tmp_path):
+    session = Mock()
+    archive_response = response({}, headers={"Content-Length": "6"})
+    archive_response.iter_content.return_value = [b"abc", b"def"]
+    session.get.return_value = archive_response
+    destination = tmp_path / "snapshot.tar.gz"
+    written = GitHubClient(session=session).download_archive(
+        "a", "b", "headsha", destination, max_bytes=10
+    )
+    assert written == 6
+    assert destination.read_bytes() == b"abcdef"
+    assert "/tarball/headsha" in session.get.call_args.args[0]
+
+
+def test_archive_download_rejects_oversized_stream_and_removes_partial_file(tmp_path):
+    session = Mock()
+    archive_response = response({})
+    archive_response.iter_content.return_value = [b"12345", b"67890"]
+    session.get.return_value = archive_response
+    destination = tmp_path / "snapshot.tar.gz"
+    with pytest.raises(GitHubAPIError, match="exceeds"):
+        GitHubClient(session=session).download_archive(
+            "a", "b", "headsha", destination, max_bytes=6
+        )
+    assert not destination.exists()
