@@ -8,6 +8,17 @@ from testpilot.generation_models import FrameworkDetection, GenerationResult, Te
 from testpilot.models import ChangedFile, CollectedContext, ContextFile, PullRequest
 
 
+def test_cli_closes_owned_session_on_pipeline_failure(monkeypatch, capsys):
+    from testpilot.github import GitHubAPIError
+
+    client = Mock()
+    client.get_pull_request.side_effect = GitHubAPIError("offline")
+    monkeypatch.setattr("testpilot.cli.GitHubClient", lambda: client)
+    assert main(["--pr", "https://github.com/a/b/pull/1"]) == 1
+    client.session.close.assert_called_once_with()
+    assert "offline" in capsys.readouterr().err
+
+
 def test_summary_is_readable_and_reports_omissions():
     pr = PullRequest(
         "a", "b", 2, "A title", "", "base", "head",
@@ -42,13 +53,14 @@ def test_generation_summary_labels_code_as_unexecuted():
 def test_cli_without_generate_tests_preserves_phase_one(monkeypatch, capsys):
     pr = PullRequest("a", "b", 1, "title", "", "base", "head", [])
     context = CollectedContext([], [], [], [], [], [], max_characters=100)
-    client = type("Client", (), {"get_pull_request": lambda self, url: pr})()
+    client = type("Client", (), {"get_pull_request": lambda self, url: pr, "session": Mock()})()
     monkeypatch.setattr("testpilot.cli.GitHubClient", lambda: client)
     monkeypatch.setattr("testpilot.cli.ContextCollector", lambda *args: type(
         "Collector", (), {"collect": lambda self, value: context}
     )())
     monkeypatch.setattr("testpilot.cli.TestGenerator", Mock(side_effect=AssertionError("not called")))
     assert main(["--pr", "https://github.com/a/b/pull/1"]) == 0
+    client.session.close.assert_called_once_with()
     assert "Pull request: a/b#1" in capsys.readouterr().out
 
 
@@ -57,7 +69,7 @@ def test_cli_generate_tests_uses_generator(monkeypatch, capsys):
     context = CollectedContext([], ["src/a.py"], [], [], [], [], max_characters=100)
     detection = FrameworkDetection("python", "pytest", ["config"])
     result = GenerationResult(summary="done", proposals=[], warnings=[])
-    client = type("Client", (), {"get_pull_request": lambda self, url: pr})()
+    client = type("Client", (), {"get_pull_request": lambda self, url: pr, "session": Mock()})()
     generator = Mock()
     generator.generate.return_value = result
     monkeypatch.setattr("testpilot.cli.GitHubClient", lambda: client)
@@ -87,7 +99,7 @@ def test_cli_execute_prints_results_and_returns_nonzero_on_failure(monkeypatch, 
         exit_code=1, failed=1, output="assertion failed",
         error="One or more generated tests failed.",
     )
-    client = type("Client", (), {"get_pull_request": lambda self, url: pr})()
+    client = type("Client", (), {"get_pull_request": lambda self, url: pr, "session": Mock()})()
     generator = Mock()
     generator.generate.return_value = generated
     executor = Mock()

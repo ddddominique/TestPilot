@@ -13,6 +13,7 @@ from .framework_detector import detect_framework, select_framework
 from .generation_models import FrameworkDetection, GenerationResult
 from .github import GitHubClient, GitHubError
 from .models import CollectedContext, PullRequest
+from .pipeline import PipelineError, PipelineService
 from .test_generator import TestGenerationError, TestGenerator
 from .workspace import WorkspaceManager
 
@@ -140,27 +141,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.execute and not args.generate_tests:
         parser.error("--execute requires --generate-tests")
     try:
-        client = GitHubClient()
-        pull_request = client.get_pull_request(args.pr)
-        context = ContextCollector(
-            client, args.max_context_chars, args.max_context_files
-        ).collect(pull_request)
-        detection = None
-        if args.generate_tests or args.framework:
-            detection = select_framework(context, args.framework, detect_framework(context))
+        # Inject the same component boundaries used by the shared API service.
+        pipeline = PipelineService(
+            github=GitHubClient(), owns_github=True, collector_factory=ContextCollector,
+            generator_factory=TestGenerator,
+            executor_factory=lambda client: TestExecutor(WorkspaceManager(client), DockerRunner()),
+            selector=lambda context, override: select_framework(context, override, detect_framework(context)),
+        )
+        outcome = pipeline.run(
+            args.pr, generate_tests=args.generate_tests, execute=args.execute,
+            framework=args.framework, max_context_chars=args.max_context_chars,
+            max_context_files=args.max_context_files, max_llm_input_chars=args.max_llm_input_chars,
+            on_generated=lambda detection, generated: print(format_generation_summary(detection, generated)),
+        )
+        pull_request, context, detection = outcome.pull_request, outcome.context, outcome.framework
         if args.generate_tests:
-            result = TestGenerator(max_input_characters=args.max_llm_input_chars).generate(
-                pull_request, context, detection
-            )
-            print(format_generation_summary(detection, result))
             if args.execute:
-                execution = TestExecutor(
-                    WorkspaceManager(client), DockerRunner()
-                ).execute(pull_request, detection, result)
-                print(format_execution_summary(execution))
-                return 0 if execution.successful else 1
+                print(format_execution_summary(outcome.execution))
+                return 0 if outcome.execution.successful else 1
             return 0
-    except (GitHubError, TestGenerationError, ValueError) as exc:
+    except (PipelineError, GitHubError, TestGenerationError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     print(format_summary(pull_request, context))
