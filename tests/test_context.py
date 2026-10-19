@@ -1,6 +1,6 @@
 import pytest
 
-from testpilot.context import ContextCollector, _is_test
+from testpilot.context import ContextCollector, _is_config, _is_test
 from testpilot.github import GitHubAPIError
 from testpilot.models import ChangedFile, PullRequest
 
@@ -51,6 +51,12 @@ def test_recognizes_common_test_file_patterns(path):
 @pytest.mark.parametrize("path", ["src/contest.py", "src/latest.ts", "src/testimony.js"])
 def test_does_not_match_test_substrings(path):
     assert not _is_test(path)
+
+
+def test_recognizes_configuration_inside_monorepo_package():
+    assert _is_config("packages/ui/package.json")
+    assert _is_config("packages/api/pyproject.toml")
+    assert _is_config(".github/workflows/tests.yml")
 
 
 def test_context_budget_truncates_and_reports_omissions():
