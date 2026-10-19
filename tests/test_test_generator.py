@@ -275,6 +275,47 @@ def test_existing_repository_path_cannot_be_overwritten():
         )
 
 
+def test_duplicate_suggested_test_paths_are_rejected():
+    result = GenerationResult(
+        summary="duplicates",
+        proposals=[proposal(), proposal()],
+        warnings=[],
+    )
+    client = Mock()
+    client.chat.completions.parse.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(parsed=result, refusal=None))]
+    )
+    with pytest.raises(
+        GeneratedCodeValidationError,
+        match=r"Duplicate suggested test path.*tests/test_parser_empty\.py",
+    ):
+        TestGenerator(client=client).generate(
+            make_pr(), make_context(), FrameworkDetection("python", "pytest", ["config"])
+        )
+
+
+def test_distinct_suggested_test_paths_are_accepted():
+    result = GenerationResult(
+        summary="distinct proposals",
+        proposals=[
+            proposal(path="tests/test_parser_empty.py"),
+            proposal(path="tests/test_parser_none.py"),
+        ],
+        warnings=[],
+    )
+    client = Mock()
+    client.chat.completions.parse.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(parsed=result, refusal=None))]
+    )
+    generated = TestGenerator(client=client).generate(
+        make_pr(), make_context(), FrameworkDetection("python", "pytest", ["config"])
+    )
+    assert [item.suggested_test_file for item in generated.proposals] == [
+        "tests/test_parser_empty.py",
+        "tests/test_parser_none.py",
+    ]
+
+
 def test_mandatory_warnings_survive_truncation_and_budget_is_enforced():
     context = replace(
         make_context(),

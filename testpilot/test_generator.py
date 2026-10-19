@@ -227,7 +227,15 @@ class TestGenerator:
             raise GeneratedCodeValidationError("Generated output exceeds the configured size limit")
         if len(result.proposals) > 20:
             raise GeneratedCodeValidationError("Generated output contains too many test proposals")
+        seen_test_paths: set[str] = set()
+        repository_files = set(context.repository_files)
         for proposal in result.proposals:
+            if proposal.suggested_test_file in seen_test_paths:
+                raise GeneratedCodeValidationError(
+                    f"Duplicate suggested test path in generation result: "
+                    f"{proposal.suggested_test_file}"
+                )
+            seen_test_paths.add(proposal.suggested_test_file)
             if proposal.framework.lower() != detection.framework:
                 raise GeneratedCodeValidationError(
                     f"Generated proposal uses {proposal.framework}, expected {detection.framework}"
@@ -238,7 +246,7 @@ class TestGenerator:
                     f"Generated proposal targets an unknown source file: "
                     f"{proposal.target_source_file}. Allowed target paths: {allowed}"
                 )
-            if proposal.suggested_test_file in set(context.repository_files):
+            if proposal.suggested_test_file in repository_files:
                 raise GeneratedCodeValidationError(
                     f"Suggested test path already exists and would be overwritten: "
                     f"{proposal.suggested_test_file}"
