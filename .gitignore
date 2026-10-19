@@ -8,3 +8,9 @@ venv/
 htmlcov/
 .DS_Store
 .testpilot/
+node_modules/
+.next/
+*.tsbuildinfo
+frontend/.env.local
+frontend/.env.*.local
+frontend/coverage/
