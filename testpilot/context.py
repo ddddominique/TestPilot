@@ -14,7 +14,7 @@ CONFIG_NAMES = {
     "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "jest.config.js",
     "jest.config.ts", "vitest.config.js", "vitest.config.ts", "package.json",
     "requirements.txt", "requirements-dev.txt", "pom.xml", "build.gradle",
-    "go.mod", "cargo.toml", ".github/workflows",
+    "go.mod", "cargo.toml",
 }
 TEST_FILE_SUFFIXES = (
     ".test.js", ".spec.js", ".test.jsx", ".spec.jsx",
@@ -30,7 +30,6 @@ def _is_test(path: str) -> bool:
         "tests" in parts
         or "test" in parts
         or "__tests__" in parts
-        or name.startswith("test_")
         or (name.startswith("test_") and name.endswith(".py"))
         or name.endswith("_test.py")
         or name.endswith(TEST_FILE_SUFFIXES)
@@ -39,7 +38,10 @@ def _is_test(path: str) -> bool:
 
 def _is_config(path: str) -> bool:
     lower = path.lower()
-    return any(lower == name or lower.startswith(name + "/") for name in CONFIG_NAMES)
+    return (
+        PurePosixPath(lower).name in CONFIG_NAMES
+        or lower.startswith(".github/workflows/")
+    )
 
 
 def _is_source(path: str) -> bool:
