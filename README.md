@@ -28,6 +28,56 @@ Public repositories work without authentication. For a higher GitHub API rate li
 export GITHUB_TOKEN="your_token"
 ```
 
+## One-command local development
+
+After first-time setup, run from the repository root:
+
+```bash
+make dev
+```
+
+This uses the existing `.venv/bin/python` (no manual activation required), loads the root `.env` through zsh, waits for the existing Compose PostgreSQL/Redis health checks, and starts FastAPI, Celery, and Next.js. Application and database/broker logs stream to the same terminal. Open `http://localhost:3000` (dashboard) or `http://127.0.0.1:8000/docs` (API).
+
+Press **Ctrl+C once** to shut down. The launcher stops web processes and their process groups, requests Celery's warm shutdown, waits for active work to finish, then stops PostgreSQL/Redis. Shutdown can take time while a task is active (the existing 30-minute Celery hard limit still applies); repeated Ctrl+C is ignored during cleanup so it does not kill prefork children mid-Docker-cleanup. If any managed service exits unexpectedly, the launcher shuts down the others too. Avoid starting a second copy or keeping separately launched services on ports 3000/8000.
+
+To stop Compose services independently:
+
+```bash
+make stop
+```
+
+Both commands retain database and Redis volumes. `make stop` only stops PostgreSQL/Redis; use Ctrl+C in the `make dev` terminal to stop host processes gracefully. The launcher also stops these project Compose services on exit if they were already running before `make dev`.
+
+### First-time prerequisites
+
+Install Docker Desktop, an up-to-date Node.js 22.16+ release (including npm), Python 3.9+, and macOS command-line tools (`make`). Start Docker Desktop, then:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+cp .env.example .env                 # Only if .env does not exist yet.
+# Edit .env: set real credentials; remove the placeholder GITHUB_TOKEN for public PRs.
+cd frontend
+npm ci
+cp .env.example .env.local           # Only if this file does not exist yet.
+cd ..
+```
+
+Prepare the database and trusted image once (and again when migrations or runner code change):
+
+```bash
+docker compose up -d --wait postgres redis
+# Root .env must use shell-compatible assignments; quote values containing spaces/shell characters.
+set -a
+source .env
+set +a
+.venv/bin/python -m alembic upgrade head
+.venv/bin/python -m testpilot.build_runner
+make dev
+```
+
+There is no `make setup`: installing tools, reviewing credentials, applying migrations, and building the trusted image remain explicit. `make dev` does not modify `.env`, install dependencies, run migrations, or rebuild the runner automatically. The zsh wrapper works even when Make's default shell is `/bin/sh`. Only source a trusted local `.env`; it is shell code. Backend children inherit its exported configuration, while known backend credentials are removed from Next.js's inherited environment; Next.js still reads `frontend/.env.local` normally. This is a local convenience launcher, not production supervision: SIGKILL, host crashes, or Docker daemon failure cannot guarantee cleanup. If Docker cannot be stopped, the launcher reports that `make stop` is needed.
+
 Phase 2 also requires an OpenAI API key. `OPENAI_MODEL` is optional and defaults to `gpt-4o-mini`; choose a model that supports Structured Outputs.
 
 ```bash
