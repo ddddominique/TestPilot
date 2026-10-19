@@ -18,7 +18,7 @@ from testpilot.api.repository import RunConflict, RunRepository
 from testpilot.execution_models import ExecutionResult, ExecutionStatus
 from testpilot.pipeline import PipelineResult
 from testpilot.worker.celery_app import app, HARD_TIME_LIMIT, RECONCILE_MIN_AGE
-from testpilot.worker.dispatcher import dispatch_once, publish
+from testpilot.worker.dispatcher import DispatchBackoff, dispatch_once, publish, still_queued
 from testpilot.worker.reconcile import reconcile
 from testpilot.worker.tasks import execute_task, run_job
 
@@ -172,7 +172,111 @@ def test_lost_redis_message_is_republished_until_worker_claims(sessions):
     assert dispatch_once(sessions, publisher, now=now + timedelta(seconds=61))
     with sessions() as session:
         RunRepository(session).claim(identifier, task_id)
-    assert not dispatch_once(sessions, publisher, now=now + timedelta(seconds=122))
+    assert not dispatch_once(sessions, publisher, now=now + timedelta(seconds=182))
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_backoff_progression_and_cap_for_failures_and_unclaimed_publications(sessions, fails):
+    identifier, task_id = queue(sessions)
+    publisher = Mock(side_effect=ConnectionError("broker unavailable") if fails else None)
+    now = datetime.now(timezone.utc) + timedelta(seconds=1)
+    for attempt, delay in enumerate([60, 120, 240, 480, 900, 900], start=1):
+        assert dispatch_once(sessions, publisher, now=now)
+        with sessions() as session:
+            intent = session.get(RunDispatch, identifier)
+            assert intent.attempts == attempt
+            assert intent.available_at.replace(tzinfo=timezone.utc) == now + timedelta(seconds=delay)
+            assert (intent.last_error is not None) == fails
+            assert (intent.published_at is None) == fails
+            row = session.get(TestRunRecord, identifier)
+            assert row.status == "QUEUED" and row.started_at is None
+            assert row.task_id == task_id
+        assert not dispatch_once(sessions, publisher, now=now + timedelta(seconds=delay - 1))
+        now += timedelta(seconds=delay)
+    assert publisher.call_args_list == [((identifier, task_id),)] * 6
+
+
+def test_extended_worker_outage_limits_messages_but_recovers_lost_delivery(sessions):
+    identifier, task_id = queue(sessions)
+    publisher = Mock()
+    start = datetime.now(timezone.utc) + timedelta(seconds=1)
+    # One hour of minute-by-minute polling: 60 fixed-interval copies become 7.
+    for seconds in range(0, 3_600, 60):
+        dispatch_once(sessions, publisher, now=start + timedelta(seconds=seconds))
+    assert publisher.call_count == 7
+    with sessions() as session:
+        intent = session.get(RunDispatch, identifier)
+        next_attempt = intent.available_at.replace(tzinfo=timezone.utc)
+    assert dispatch_once(sessions, publisher, now=next_attempt)
+    service = pipeline()
+    for call in publisher.call_args_list:
+        assert call.args == (identifier, task_id)
+        run_job(*call.args, sessions, lambda: service)
+    service.run.assert_called_once_with(URL)
+    assert not dispatch_once(sessions, publisher, now=next_attempt + timedelta(seconds=901))
+
+
+@pytest.mark.parametrize("status", ["RUNNING", "COMPLETED", "FAILED"])
+def test_terminal_or_running_jobs_are_not_published(sessions, status):
+    identifier, task_id = queue(sessions)
+    with sessions() as session:
+        RunRepository(session).claim(identifier, task_id)
+    if status != "RUNNING":
+        with sessions() as session:
+            RunRepository(session).finish(identifier, {"status": status})
+    publisher = Mock()
+    assert not dispatch_once(sessions, publisher, now=datetime.now(timezone.utc) + timedelta(days=1))
+    publisher.assert_not_called()
+
+
+def test_worker_claim_between_lease_and_publication_is_rechecked(sessions, monkeypatch):
+    identifier, task_id = queue(sessions)
+
+    def claim_then_check(factory, run_id, job_id, token):
+        with sessions() as session:
+            RunRepository(session).claim(identifier, task_id)
+        return still_queued(factory, run_id, job_id, token)
+
+    monkeypatch.setattr("testpilot.worker.dispatcher.still_queued", claim_then_check)
+    publisher = Mock()
+    assert dispatch_once(sessions, publisher, now=datetime.now(timezone.utc) + timedelta(seconds=1))
+    publisher.assert_not_called()
+
+
+def test_broker_io_has_no_checked_out_database_connection(sessions):
+    queue(sessions)
+
+    def publish_without_connection(*args):
+        assert sessions.kw["bind"].pool.checkedout() == 0
+
+    assert dispatch_once(sessions, publish_without_connection,
+                         now=datetime.now(timezone.utc) + timedelta(seconds=1))
+
+
+def test_configured_backoff_is_loaded_and_applied(sessions, monkeypatch):
+    monkeypatch.setenv("TESTPILOT_DISPATCH_INTERVAL_SECONDS", "120")
+    monkeypatch.setenv("TESTPILOT_DISPATCH_MAX_BACKOFF_SECONDS", "300")
+    assert DispatchBackoff.from_environment() == DispatchBackoff(120, 300)
+    identifier, _ = queue(sessions)
+    now = datetime.now(timezone.utc) + timedelta(seconds=1)
+    assert dispatch_once(sessions, Mock(), now=now)
+    with sessions() as session:
+        assert session.get(RunDispatch, identifier).available_at.replace(tzinfo=timezone.utc) == now + timedelta(seconds=120)
+    assert [DispatchBackoff(120, 300).delay(i) for i in [1, 2, 3, 1_000_000_000]] == [120, 240, 300, 300]
+
+
+@pytest.mark.parametrize("interval,maximum", [("0", "900"), ("-1", "900"), ("60", "59"),
+                                               ("60", "86401"), ("1.5", "900"), ("60", "invalid")])
+def test_invalid_backoff_configuration_fails_before_leasing(sessions, monkeypatch, interval, maximum):
+    monkeypatch.setenv("TESTPILOT_DISPATCH_INTERVAL_SECONDS", interval)
+    monkeypatch.setenv("TESTPILOT_DISPATCH_MAX_BACKOFF_SECONDS", maximum)
+    identifier, _ = queue(sessions)
+    publisher = Mock()
+    with pytest.raises(ValueError):
+        dispatch_once(sessions, publisher)
+    publisher.assert_not_called()
+    with sessions() as session:
+        assert session.get(RunDispatch, identifier).attempts == 0
 
 
 @pytest.mark.parametrize("status,lifecycle", [
