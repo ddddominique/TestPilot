@@ -5,6 +5,7 @@ TestPilot is an AI-powered pull-request testing agent. It currently implements:
 - **Phase 1:** retrieve GitHub PR metadata, changed files, patches, and bounded repository context.
 - **Phase 2:** detect pytest, Jest, or Vitest and optionally use OpenAI Structured Outputs to produce validated test proposals.
 - **Phase 3:** opt-in execution of generated pytest modules against an exact PR head snapshot inside Docker.
+- **Phase 4.1:** a FastAPI REST API that persists pending runs in PostgreSQL.
 
 Without `--execute`, generated tests remain proposals only. Execution materializes them in temporary storage outside your project. TestPilot never modifies the target repository, creates commits, or posts PR comments. Webhooks and a frontend are not implemented.
 
@@ -223,3 +224,81 @@ TESTPILOT_DOCKER_INTEGRATION=1 python -m pytest -q -s tests/test_docker_integrat
 ```
 
 The integration scenarios are skipped unless explicitly enabled and Docker plus the runner image are available. A skipped test does not demonstrate container execution.
+
+## Phase 4.1 REST API and PostgreSQL
+
+The API stores run requests and history. `POST /api/runs` only creates a persistent `PENDING` record: it makes no GitHub HTTP request and does not start generation or execution. Runs remain pending until a future processing milestone. Existing CLI generation and Docker execution continue to work independently and are not automatically persisted by the API.
+
+From the project root, install the updated requirements and configure local development:
+
+```bash
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+```
+
+Edit `.env` and keep `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `DATABASE_URL` consistent. Example credentials are development placeholders; never commit real credentials. Passwords with URL-reserved characters must be percent-encoded in `DATABASE_URL`. Compose reads `.env` automatically; export its values for Alembic and FastAPI:
+
+```bash
+set -a
+. ./.env
+set +a
+docker compose up -d --wait postgres
+python -m alembic upgrade head
+python -m uvicorn testpilot.api.app:app --reload --host 127.0.0.1 --port 8000
+```
+
+The database is PostgreSQL 17, bound only to `127.0.0.1:5432`, with a health check and named volume. `docker compose down` stops the local database while retaining its volume. Changing the Compose password does not change credentials in an already initialized PostgreSQL volume. The API requires `DATABASE_URL` using `postgresql+psycopg://...`; it does not load `.env` itself or create tables at startup. Alembic migrations must be applied before creating/listing runs. No OpenAI or GitHub credentials are required for these API operations. API documentation is available at `http://127.0.0.1:8000/docs`.
+
+| Endpoint | Behavior |
+| --- | --- |
+| `GET /health` | `200 {"status":"ok"}`; basic process liveness, not database readiness |
+| `POST /api/runs` | Accepts `{"pr_url":"https://github.com/owner/repo/pull/123"}`; returns `201` with the UUID, `PENDING` status, and run fields; includes a `Location` header |
+| `GET /api/runs/{run_id}` | Returns the run; unknown UUIDs return `404` |
+| `GET /api/runs?limit=20&offset=0` | Returns `{items,total,limit,offset}`, ordered by creation time descending with UUID tie-breaking |
+
+Request validation failures return `422`, including malformed URLs/UUIDs and invalid pagination. `limit` is 1–100 and `offset` is 0–1,000,000. URLs are validated using the existing GitHub PR parser, checked for valid repository components and a positive PR number, and canonicalized to HTTPS. Repeated submissions create separate runs. This validates URL syntax, not whether a private/deleted PR actually exists. Database failures return a sanitized `503`, without SQL or connection credentials.
+
+```bash
+curl http://127.0.0.1:8000/health
+curl -i -X POST http://127.0.0.1:8000/api/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"pr_url":"https://github.com/ddddominique/Coding-Exercise/pull/1"}'
+curl 'http://127.0.0.1:8000/api/runs?limit=10&offset=0'
+# Replace RUN_UUID with the UUID returned by POST:
+curl http://127.0.0.1:8000/api/runs/RUN_UUID
+```
+
+API architecture:
+
+- `testpilot/api/app.py`: application factory, engine lifecycle, and sanitized database errors.
+- `database.py`: environment configuration, psycopg engine, and request-scoped sessions.
+- `db_models.py`: SQLAlchemy 2.x `test_runs` model with UUIDs, timezone-aware timestamps, JSONB generated-test metadata, nonnegative counts, and constrained statuses reusing the execution status vocabulary.
+- `schemas.py`: Pydantic request/response models and PR URL validation.
+- `repository.py`: transactional create, lookup, and pagination operations.
+- `routes.py`: HTTP routing, status codes, and pagination bounds.
+- `migrations/`: Alembic schema revisions. Initial migration: `0001_create_test_runs`.
+
+Write transactions commit before returning HTTP 201; exceptions roll back. Sessions close after every request and the application disposes its engine on shutdown. `updated_at` is maintained on SQLAlchemy updates; direct SQL writers must update it explicitly. Head SHA, framework, output, and errors remain null on pending records, counts start at zero, and generated-test metadata starts as an empty JSON array.
+
+New dependencies are FastAPI, Uvicorn, SQLAlchemy 2.x, Alembic, psycopg 3 with its binary distribution, and HTTPX for the API test client. Python 3.9 compatibility is preserved.
+
+### API tests and limitations
+
+```bash
+python -m pytest -q
+python -m pytest -q tests/test_api.py
+```
+
+Offline API tests use an injected SQLite session factory with a JSON test variant; production configuration still requires PostgreSQL and JSONB. They verify request validation, durable writes across sessions/app instances, history ordering/pagination, constraints, transaction rollback, and that POST cannot invoke the existing pipeline. An offline Alembic test compiles the actual migration to PostgreSQL UUID/JSONB SQL. These checks do not substitute for a real PostgreSQL migration test.
+
+To test actual PostgreSQL behavior, point `TESTPILOT_TEST_DATABASE_URL` at a dedicated test database using the psycopg URL format:
+
+```bash
+export TESTPILOT_TEST_DATABASE_URL='postgresql+psycopg://testpilot:change_me_for_local_development@localhost:5432/testpilot'
+python -m pytest -q tests/test_api_postgres.py
+```
+
+That opt-in test creates a uniquely named temporary schema, applies the real Alembic migration, checks API persistence/JSONB/rollback, and drops only its temporary schema afterward. It requires schema-creation privileges and is skipped unless the test URL is provided.
+
+There is no authentication, authorization, background processing, frontend, or automatic execution yet. Keep this API on localhost for development. Offset-based pagination may shift between requests during concurrent inserts. `/health` does not verify that PostgreSQL is reachable or migrations are current.
