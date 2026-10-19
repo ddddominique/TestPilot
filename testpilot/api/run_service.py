@@ -1,8 +1,10 @@
 """Short persistence transactions around the synchronous shared pipeline."""
 
+import hashlib
 import json
 import os
 import re
+from typing import Optional
 from urllib.parse import unquote, urlsplit
 
 from testpilot.execution_models import ExecutionStatus
@@ -11,8 +13,10 @@ from testpilot.pipeline import PipelineError, PipelineResult
 from .repository import RunRepository
 
 
-def sanitized(value: str, limit: int) -> str:
-    """Bound UTF-8 diagnostics and redact configured credentials and common forms."""
+def sanitized(value: str, limit: Optional[int]) -> str:
+    """Redact text; None disables truncation for whole-module size checks."""
+    if not isinstance(value, str):
+        value = "[INVALID DIAGNOSTIC]" if value is not None else ""
     for key in ("OPENAI_API_KEY", "GITHUB_TOKEN", "DATABASE_URL"):
         secret = os.getenv(key)
         if secret:
@@ -29,16 +33,60 @@ def sanitized(value: str, limit: int) -> str:
     value = re.sub(r"(postgres(?:ql)?(?:\+psycopg)?://)[^\s/@]+:[^\s/@]+@", r"\1[REDACTED]@", value)
     value = value.replace("\x00", "")
     raw = value.encode("utf-8", errors="replace")
-    if len(raw) <= limit:
+    if limit is None or len(raw) <= limit:
         return raw.decode("utf-8")
     marker = b"\n[TRUNCATED]"
+    if limit < len(marker):
+        return marker[:max(0, limit)].decode()
     return raw[:limit - len(marker)].decode("utf-8", errors="ignore") + marker.decode()
+
+
+def diagnostics(items, count):
+    """Do not stringify malformed objects or expand malformed warning strings."""
+    if not isinstance(items, (list, tuple)):
+        return ["[INVALID DIAGNOSTIC LIST]"]
+    return [sanitized(item, 2_000) for item in items[:count]]
+
+
+def generated_metadata(proposals):
+    """Retain whole modules only, identifying any display-only transformation."""
+    omitted = "Generated test metadata omitted because its persistence limit or encoding was invalid."
+    if len(proposals) > 20:
+        return [], [omitted]
+    originals = [proposal.model_dump(mode="json") for proposal in proposals]
+    try:
+        if len(json.dumps(originals, ensure_ascii=False).encode("utf-8")) > 400_000:
+            return [], [omitted]
+    except UnicodeError:
+        return [], [omitted]
+    stored = []
+    modified = False
+    for original in originals:
+        code = original["test_code"]
+        # The total original payload already fits. Redaction can expand it;
+        # reject that case rather than ever truncating an executable module.
+        display = sanitized(code, None)
+        if len(display.encode("utf-8")) > 400_000:
+            return [], [omitted]
+        item = {key: (diagnostics(value, 32) if isinstance(value, list)
+                      else sanitized(value, 4_000))
+                for key, value in original.items() if key != "test_code"}
+        item.update(test_code=display, test_code_sha256=hashlib.sha256(code.encode("utf-8")).hexdigest(),
+                    test_code_representation="original" if display == code else "redacted_display")
+        modified = modified or display != code or any(item[key] != value for key, value in original.items())
+        stored.append(item)
+    if len(json.dumps(stored, ensure_ascii=False).encode("utf-8")) > 400_000:
+        return [], [omitted]
+    warnings = (["Stored generated-test metadata was sanitized; redacted_display code is not the original source."]
+                if modified else [])
+    return stored, warnings
 
 
 def result_values(result: PipelineResult, failure_stage=None) -> dict:
     values = {"status": "COMPLETED", "warnings": []}
+    notices = []
     if result.context is not None:
-        values["warnings"].extend(result.context.warnings)
+        values["warnings"].extend(diagnostics(result.context.warnings, 64))
     if result.pull_request is not None:
         pr = result.pull_request
         values.update(repository=f"{pr.owner}/{pr.repository}", pr_number=pr.number, head_sha=pr.head_sha)
@@ -46,30 +94,15 @@ def result_values(result: PipelineResult, failure_stage=None) -> dict:
         selected = result.framework
         values.update(
             framework=selected.framework, framework_selection=selected.selection,
-            framework_evidence=[sanitized(item, 2_000) for item in selected.evidence[:32]],
+            framework_evidence=diagnostics(selected.evidence, 32),
         )
-        values["warnings"].extend(selected.warnings)
+        values["warnings"].extend(diagnostics(selected.warnings, 64))
     if result.generation is not None:
         generation = result.generation
-        # Preserve complete code rather than silently truncating a test module.
-        encoded = json.dumps([item.model_dump(mode="json") for item in generation.proposals], ensure_ascii=False)
-        if len(encoded.encode("utf-8")) <= 400_000 and len(generation.proposals) <= 20:
-            # Serialize strings individually: redaction must not corrupt JSON escapes.
-            values["generated_tests"] = [
-                {key: ([sanitized(entry, 4_000) for entry in item[:32]] if isinstance(item, list)
-                       else sanitized(item, 400_000)) for key, item in proposal.model_dump().items()}
-                for proposal in generation.proposals
-            ]
-            if len(json.dumps(values["generated_tests"], ensure_ascii=False).encode("utf-8")) > 400_000:
-                values["generated_tests"] = []
-                values["warnings"].append("Generated test metadata omitted after redaction exceeded its size limit.")
-            elif json.dumps(values["generated_tests"], ensure_ascii=False) != encoded:
-                values["warnings"].append("Stored generated-test metadata was sanitized; redacted code may differ from executed code.")
-        else:
-            values["generated_tests"] = []
-            values["warnings"].append("Generated test metadata omitted because its persistence limit was exceeded.")
+        values["generated_tests"], notices = generated_metadata(generation.proposals)
+        values["warnings"] = notices + values["warnings"]
         values["generation_summary"] = sanitized(generation.summary, 8_000)
-        values["warnings"].extend(generation.warnings)
+        values["warnings"].extend(diagnostics(generation.warnings, 64))
     if result.execution is not None:
         execution = result.execution
         values.update(
@@ -81,7 +114,7 @@ def result_values(result: PipelineResult, failure_stage=None) -> dict:
         )
         # Keep cleanup/security diagnostics ahead of potentially many context
         # omissions when the persisted warning list reaches its cap.
-        values["warnings"] = list(execution.warnings) + values["warnings"]
+        values["warnings"] = diagnostics(execution.warnings, 64 - len(notices)) + values["warnings"]
         if execution.status == ExecutionStatus.INFRASTRUCTURE_ERROR:
             values["status"] = "FAILED"
     elif failure_stage is None:
@@ -94,7 +127,7 @@ def result_values(result: PipelineResult, failure_stage=None) -> dict:
         values["error_details"] = f"Pipeline failed during {stage}; check service configuration and availability."
         if stage == "execution":
             values["execution_outcome"] = ExecutionStatus.INFRASTRUCTURE_ERROR.value
-    values["warnings"] = [sanitized(str(item), 2_000) for item in values["warnings"][:64]]
+    values["warnings"] = diagnostics(values["warnings"], 64)
     return values
 
 

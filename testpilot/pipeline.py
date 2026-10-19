@@ -31,8 +31,10 @@ class PipelineError(RuntimeError):
 
 
 class PipelineService:
-    def __init__(self, github=None, collector_factory=None, generator_factory=None, executor_factory=None, selector=None):
-        self._owns_github = github is None
+    def __init__(self, github=None, collector_factory=None, generator_factory=None, executor_factory=None, selector=None,
+                 *, owns_github=False):
+        # Injected clients remain caller-owned unless ownership is transferred.
+        self._owns_github = github is None or owns_github
         self.github = github if github is not None else GitHubClient()
         self.collector_factory = collector_factory or ContextCollector
         self.generator_factory = generator_factory or TestGenerator

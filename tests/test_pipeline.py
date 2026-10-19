@@ -36,6 +36,7 @@ def test_shared_pipeline_invokes_existing_components_and_returns_results():
     executor.execute.assert_called_once_with(pr, selected, generation)
     assert result.execution == execution
     assert result.pull_request == pr
+    github.session.close.assert_not_called()
 
 
 def test_shared_pipeline_context_only_does_not_generate_or_execute():
@@ -62,6 +63,27 @@ def test_pipeline_failures_preserve_partial_metadata_and_stage(stage):
     with pytest.raises(PipelineError) as error:
         pipeline.run("https://github.com/a/b/pull/1")
     assert error.value.stage == stage
+    github.session.close.assert_not_called()
     assert (error.value.partial.pull_request is None) == (stage == "github")
     if stage == "execution":
         assert error.value.partial.generation is not None
+
+
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("transferred", [False, True])
+def test_owned_sessions_close_once_even_on_failure(monkeypatch, fail, transferred):
+    github = Mock()
+    github.get_pull_request.return_value = Mock()
+    if fail:
+        github.get_pull_request.side_effect = GitHubAPIError("offline")
+    monkeypatch.setattr("testpilot.pipeline.GitHubClient", lambda: github)
+    pipeline = PipelineService(
+        github=github if transferred else None, owns_github=transferred,
+        collector_factory=lambda *args: Mock(),
+    )
+    if fail:
+        with pytest.raises(PipelineError):
+            pipeline.run("url", generate_tests=False, execute=False)
+    else:
+        pipeline.run("url", generate_tests=False, execute=False)
+    github.session.close.assert_called_once_with()

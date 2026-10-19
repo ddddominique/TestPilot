@@ -143,7 +143,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         # Inject the same component boundaries used by the shared API service.
         pipeline = PipelineService(
-            github=GitHubClient(), collector_factory=ContextCollector,
+            github=GitHubClient(), owns_github=True, collector_factory=ContextCollector,
             generator_factory=TestGenerator,
             executor_factory=lambda client: TestExecutor(WorkspaceManager(client), DockerRunner()),
             selector=lambda context, override: select_framework(context, override, detect_framework(context)),

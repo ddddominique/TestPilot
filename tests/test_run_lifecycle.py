@@ -1,4 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import json
 from dataclasses import replace
 from threading import Barrier, Event
 from unittest.mock import Mock
@@ -87,6 +89,9 @@ def test_execute_persists_lifecycle_results_and_survives_restart(sessions, outco
         assert saved["framework"] == "pytest"
         assert saved["framework_selection"] == "inferred"
         assert saved["generated_tests"][0]["test_code"].startswith("from app")
+        stored = saved["generated_tests"][0]
+        assert stored["test_code_representation"] == "original"
+        assert stored["test_code_sha256"] == hashlib.sha256(stored["test_code"].encode()).hexdigest()
         assert saved["execution_output"] == "test evidence"
         assert saved["started_at"] is not None and saved["completed_at"] is not None
         assert client.post(f"/api/runs/{pending['id']}/execute").status_code == 409
@@ -222,11 +227,101 @@ def test_generated_tests_are_redacted_and_oversized_modules_are_not_partially_sa
     values = result_values(result)
     assert "sk-private-code-value" not in str(values)
     assert "[REDACTED]" in values["generated_tests"][0]["test_code"]
+    stored = values["generated_tests"][0]
+    assert stored["test_code_representation"] == "redacted_display"
+    assert stored["test_code_sha256"] == hashlib.sha256(result.generation.proposals[0].test_code.encode()).hexdigest()
     assert any("sanitized" in item for item in values["warnings"])
     result.generation.proposals[0].test_code = "x" * 400_001
     oversized = result_values(result)
     assert oversized["generated_tests"] == []
     assert any("omitted" in warning for warning in oversized["warnings"])
+
+
+def test_original_module_is_preserved_exactly_with_source_digest():
+    result = pipeline_result()
+    original = result.generation.proposals[0].test_code
+    stored = result_values(result)["generated_tests"][0]
+    assert stored["test_code"] == original
+    assert stored["test_code_representation"] == "original"
+    assert stored["test_code_sha256"] == hashlib.sha256(original.encode()).hexdigest()
+
+
+def test_redaction_expansion_cannot_exceed_metadata_budget(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "xyz")
+    result = pipeline_result()
+    result.generation.proposals[0].test_code = "#" + "xyz " * 40_000
+    result.generation.warnings = ["xyz"] * 100
+    result.framework = replace(result.framework, warnings=["xyz"] * 100)
+    values = result_values(result)
+    assert values["generated_tests"] == []
+    assert any("omitted" in warning for warning in values["warnings"])
+    assert "xyz" not in json.dumps(values)
+
+
+def test_metadata_budget_includes_digest_and_representation():
+    result = pipeline_result()
+    proposal = result.generation.proposals[0]
+    proposal.test_code = ""
+    original = proposal.model_dump(mode="json")
+    overhead = len(json.dumps([original], ensure_ascii=False).encode()) - len(proposal.test_code.encode())
+    proposal.test_code = "x" * (400_000 - overhead)
+    assert len(json.dumps([proposal.model_dump(mode="json")], ensure_ascii=False).encode()) == 400_000
+    assert result_values(result)["generated_tests"] == []
+
+
+def test_malformed_and_large_diagnostics_are_safe_and_bounded():
+    result = pipeline_result()
+    result.framework = replace(result.framework,
+                               evidence=[None, {"secret": "not a diagnostic"}, "é\x00\ud800" * 10_000] * 40,
+                               warnings="malformed list")
+    result.generation.warnings = [None, "é" * 10_000] * 100
+    result.execution = replace(result.execution, output="é\x00\ud800" * 100_000, error=None)
+    values = result_values(result)
+    assert len(values["framework_evidence"]) == 32
+    assert len(values["warnings"]) == 64
+    assert all(len(item.encode()) <= 2_000 for item in values["warnings"] + values["framework_evidence"])
+    assert len(values["execution_output"].encode()) <= 64_000
+    assert "\x00" not in json.dumps(values, ensure_ascii=False)
+    assert "not a diagnostic" not in str(values)
+
+
+@pytest.mark.parametrize("code", ["\ud800", "x" * 400_001])
+def test_invalid_or_oversized_code_is_omitted_entirely(code):
+    result = pipeline_result()
+    result.generation.proposals[0].test_code = code
+    assert result_values(result)["generated_tests"] == []
+
+
+def test_proposal_count_limit_is_preserved():
+    result = pipeline_result()
+    result.generation.proposals *= 21
+    assert result_values(result)["generated_tests"] == []
+
+
+def test_secrets_are_redacted_across_metadata_and_warnings(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://user:db-password@localhost/db")
+    monkeypatch.setenv("OPENAI_API_KEY", "private-api-credential")
+    result = pipeline_result()
+    secret_text = "private-api-credential db-password\nAuthorization: Basic confidential\nBearer opaque-token"
+    proposal = result.generation.proposals[0]
+    proposal.test_code = "# " + secret_text
+    proposal.explanation = secret_text
+    proposal.assumptions = [secret_text]
+    result.generation.warnings = [secret_text]
+    result.generation.summary = secret_text
+    result.framework = replace(result.framework, evidence=[secret_text])
+    encoded = json.dumps(result_values(result))
+    for secret in ("private-api-credential", "db-password", "confidential", "opaque-token"):
+        assert secret not in encoded
+
+
+def test_omission_notice_survives_full_execution_warning_list():
+    result = pipeline_result()
+    result.generation.proposals[0].test_code = "x" * 400_001
+    result.execution = replace(result.execution, warnings=["execution warning"] * 100)
+    values = result_values(result)
+    assert len(values["warnings"]) == 64
+    assert any("omitted" in warning for warning in values["warnings"])
 
 
 def test_generic_factory_error_is_persisted_without_exposing_exception(sessions):
