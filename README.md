@@ -101,7 +101,42 @@ These are non-executing checks. They do not prove that imports resolve or tests 
 - JavaScript/TypeScript: Jest
 - JavaScript/TypeScript: Vitest
 
-Unknown or equally conflicting evidence stops generation with a clear error.
+Framework selection first preserves a compatible evidence-based detection. When no supported framework evidence exists, it examines only the relevant changed source paths: Python-only PRs infer pytest, explicitly labeled `inferred` in prompts and CLI reports. Other languages elsewhere in the repository do not affect that fallback. For example, a multilingual repository whose PR only adds `leetcode/2089.py` can generate pytest proposals without prior test configuration.
+
+Use `--framework pytest`, `--framework jest`, or `--framework vitest` to override selection explicitly. Pytest requires all relevant changed sources to be Python; Jest/Vitest require JavaScript/TypeScript. Mixed-language, unsupported, empty-source, and incompatible changes fail clearly. Without an override, conflicting framework evidence still fails; JS/TS changes with no evidence require an explicit choice between Jest and Vitest. The selected framework and its `detected`, `inferred`, or `override` origin and evidence are carried through generation, validation, execution, and reports. Execution remains pytest-only.
+
+```bash
+python main.py --pr https://github.com/ddddominique/Coding-Exercise/pull/1 --generate-tests
+python main.py --pr https://github.com/ddddominique/Coding-Exercise/pull/1 --generate-tests --framework pytest
+```
+
+An inferred framework does not imply that imports, dependencies, or test proposals are verified. Existing validation and opt-in execution restrictions still apply.
+
+## Source paths in generated Python tests
+
+Repository sources and generated tests are mounted separately: `/workspace/repo/<source path>` and `/workspace/generated/<test path>`. A generated test's `__file__` belongs to the generated-test mount, so `Path(__file__).with_name("2089.py")` does not locate `leetcode/2089.py` in the snapshot.
+
+The trusted pytest runner sets `TESTPILOT_SOURCE_ROOT=/workspace/repo` before collecting generated tests. Ordinary supported package imports continue to use the repository root and `src/` import paths. For standalone files with names that cannot be normal Python module identifiers, generated modules must use the complete repository-relative source path against this root. For example:
+
+```python
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+source_path = Path(os.environ["TESTPILOT_SOURCE_ROOT"]) / "leetcode/2089.py"
+spec = importlib.util.spec_from_file_location("solution_2089", source_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+def test_target_indices():
+    assert module.Solution().targetIndices([1, 2, 5, 2, 3], 2) == [1, 2]
+```
+
+The generation prompt specifies this contract and includes a loader example. Syntax-only validation also rejects recognizable target-source paths derived from `__file__` (including common single-assignment aliases) or rooted in `/workspace/generated`. The check runs again before materialization. Test-local fixture paths using `__file__` remain supported when they do not refer to the target source. Dynamic path construction cannot be fully proved correct by these checks; import behavior and assertions still require isolated execution. Source files are never copied alongside generated tests or rewritten to make incorrect paths work.
+
+Changing the trusted runner requires rebuilding its provenance record with `python -m testpilot.build_runner` before execution. If you manually run exported proposals elsewhere, supply `TESTPILOT_SOURCE_ROOT` pointing to that checkout; TestPilot itself continues to execute proposals only in Docker.
 
 ## Tests
 
@@ -180,7 +215,7 @@ Normal unit tests mock GitHub, OpenAI, and Docker, and require no daemon or cred
 python -m pytest -q
 ```
 
-The optional integration test prepares a trusted archive containing an `add()` function, verifies immutable SHA selection, materializes a complete generated module, and runs two scenarios: `add(1, 2) == 3` passes and `add(1, 2) == 99` fails. It prints structured reports and requires no live GitHub PR or OpenAI request:
+The optional integration tests prepare trusted archives, verify immutable SHA selection, and materialize complete generated modules. They exercise passing and failing `add()` assertions plus source-root-based loading of `leetcode/2089.py` and a deeper nested numeric filename from a separate generated-test mount. They require no live GitHub PR or OpenAI request:
 
 ```bash
 python -m testpilot.build_runner

@@ -1,4 +1,6 @@
-from testpilot.framework_detector import detect_framework
+import pytest
+
+from testpilot.framework_detector import detect_framework, select_framework
 from testpilot.models import CollectedContext, ContextFile
 
 
@@ -100,3 +102,72 @@ def test_malformed_configuration_does_not_invent_dependency_evidence():
         ContextFile("package.json", "config", '{"devDependencies":{"jest":'),
     ]))
     assert result.framework == "unknown"
+
+
+def test_coding_exercise_python_only_pr_in_multilanguage_repository():
+    collected = CollectedContext(
+        [ContextFile("leetcode/2089.py", "source", "class Solution:\n    pass\n")],
+        ["leetcode/2089.py"], [], [], [],
+        repository_files=["leetcode/2089.py", "leetcode/1.cpp", "leetcode/2.java", "leetcode/3.js"],
+    )
+    assert detect_framework(collected).framework == "unknown"
+    selected = select_framework(collected)
+    assert (selected.language, selected.framework, selected.selection) == ("python", "pytest", "inferred")
+    assert "leetcode/2089.py" in selected.evidence[0]
+    assert "inferred" in selected.warnings[0]
+
+
+def test_supported_detection_is_preserved_before_fallback():
+    collected = context([ContextFile("pytest.ini", "config", "[pytest]")])
+    detected = detect_framework(collected)
+    assert select_framework(collected, detection=detected) is detected
+    assert detected.selection == "detected"
+
+
+@pytest.mark.parametrize("paths", [
+    [], ["leetcode/2089.py", "solutions/x.cpp"], ["app.py", "app.ts"],
+    ["solution.java"], ["app.js"],
+])
+def test_absent_framework_does_not_guess_for_ambiguous_or_unsupported_changes(paths):
+    collected = CollectedContext([], paths, [], [], [])
+    with pytest.raises(ValueError, match="Framework selection failed"):
+        select_framework(collected)
+
+
+@pytest.mark.parametrize("framework,paths", [
+    ("pytest", ["leetcode/2089.py"]),
+    ("jest", ["src/a.js", "src/b.tsx"]),
+    ("vitest", ["src/a.ts", "src/b.jsx"]),
+])
+def test_compatible_explicit_overrides(framework, paths):
+    collected = CollectedContext([], paths, [], [], [])
+    selected = select_framework(collected, framework)
+    assert selected.framework == framework
+    assert selected.selection == "override"
+    assert f"--framework {framework}" in selected.evidence[0]
+
+
+@pytest.mark.parametrize("framework,paths", [
+    ("pytest", ["a.ts"]), ("jest", ["a.py"]), ("vitest", ["a.java"]),
+    ("pytest", ["a.py", "b.js"]), ("jest", ["a.js", "b.py"]),
+])
+def test_incompatible_override_is_rejected(framework, paths):
+    with pytest.raises(ValueError, match="incompatible"):
+        select_framework(CollectedContext([], paths, [], [], []), framework)
+
+
+def test_conflicting_framework_evidence_requires_override_even_with_python_changes():
+    collected = context([
+        ContextFile("jest.config.js", "config", "export default {}"),
+        ContextFile("vitest.config.js", "config", "export default {}"),
+    ], ["app.py"])
+    with pytest.raises(ValueError, match="conflicting"):
+        select_framework(collected)
+
+
+def test_compatible_override_resolves_jest_vitest_conflict():
+    collected = context([
+        ContextFile("jest.config.js", "config", "export default {}"),
+        ContextFile("vitest.config.js", "config", "export default {}"),
+    ], ["app.ts"])
+    assert select_framework(collected, "vitest").selection == "override"

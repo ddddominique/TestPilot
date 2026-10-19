@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -94,6 +95,7 @@ class ResultPlugin:
 
 
 def main() -> int:
+    os.environ["TESTPILOT_SOURCE_ROOT"] = "/workspace/repo"
     # Python isolated mode prevents repository sitecustomize startup hooks.
     # Add project imports only after loading this trusted runner and pytest.
     sys.path.extend(["/workspace/repo", "/workspace/repo/src"])

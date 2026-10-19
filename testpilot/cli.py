@@ -9,7 +9,7 @@ from typing import Sequence
 from .context import ContextCollector
 from .execution_models import ExecutionResult, ExecutionStatus
 from .executor import DockerRunner, TestExecutor
-from .framework_detector import detect_framework
+from .framework_detector import detect_framework, select_framework
 from .generation_models import FrameworkDetection, GenerationResult
 from .github import GitHubClient, GitHubError
 from .models import CollectedContext, PullRequest
@@ -61,6 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-llm-input-chars", type=int, default=100_000)
     parser.add_argument(
+        "--framework", choices=("pytest", "jest", "vitest"),
+        help="Explicit test framework, compatible with every relevant changed source file",
+    )
+    parser.add_argument(
         "--execute", action="store_true",
         help="Run generated pytest proposals in the restricted Docker runner",
     )
@@ -71,7 +75,8 @@ def format_generation_summary(
     detection: FrameworkDetection, result: GenerationResult
 ) -> str:
     lines = [
-        f"Detected framework: {detection.framework} ({detection.language})",
+        f"{'Detected' if detection.selection == 'detected' else 'Selected'} framework: {detection.framework} ({detection.language})",
+        f"Framework selection: {detection.selection}",
         "Evidence:",
         *(f"  - {item}" for item in detection.evidence),
         f"Generation summary: {result.summary}",
@@ -105,6 +110,8 @@ def format_execution_summary(result: ExecutionResult) -> str:
         f"Repository: {result.repository}#{result.pr_number}",
         f"Head commit: {result.head_sha}",
         f"Framework: {result.framework}",
+        f"Framework selection: {result.framework_selection}",
+        *(f"Framework evidence: {item}" for item in result.framework_evidence),
         f"Docker execution started: {'yes' if result.docker_started else 'no'}",
         f"Generated test files: {', '.join(result.test_files) or '(none)'}",
         f"Overall status: {result.status.value}",
@@ -138,8 +145,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         context = ContextCollector(
             client, args.max_context_chars, args.max_context_files
         ).collect(pull_request)
+        detection = None
+        if args.generate_tests or args.framework:
+            detection = select_framework(context, args.framework, detect_framework(context))
         if args.generate_tests:
-            detection = detect_framework(context)
             result = TestGenerator(max_input_characters=args.max_llm_input_chars).generate(
                 pull_request, context, detection
             )
@@ -155,4 +164,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     print(format_summary(pull_request, context))
+    if detection is not None:
+        print(f"Selected framework: {detection.framework} ({detection.selection})")
+        for item in detection.evidence + detection.warnings:
+            print(f"  - {item}")
     return 0

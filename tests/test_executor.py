@@ -348,3 +348,16 @@ def test_missing_provenance_prevents_docker_run(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="provenance missing"):
         runner.run(docker_workspace(tmp_path))
     assert not any(cmd[:2] == ["docker", "run"] for cmd in backend.commands)
+
+
+def test_execution_preserves_framework_selection_evidence_and_warnings():
+    selected = FrameworkDetection(
+        "python", "pytest", ["All changed sources are Python"],
+        ["pytest inferred without existing framework evidence"], selection="inferred",
+    )
+    result = TestExecutor(FakeManager(), FakeDocker()).execute(pr(), selected, generation(proposal()))
+    assert result.status == ExecutionStatus.PASSED
+    assert result.framework == "pytest"
+    assert result.framework_selection == "inferred"
+    assert result.framework_evidence == selected.evidence
+    assert selected.warnings[0] in result.warnings

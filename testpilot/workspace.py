@@ -13,7 +13,7 @@ from typing import Optional
 
 from pydantic import ValidationError
 
-from .generation_models import GenerationResult, TestProposal
+from .generation_models import GenerationResult, TestProposal, validate_python_source_paths
 from .github import GitHubClient, GitHubError
 from .models import PullRequest
 
@@ -187,7 +187,11 @@ class WorkspaceManager:
                 relative_parent.mkdir(exist_ok=True)
             if not target.resolve(strict=False).is_relative_to(generated_root):
                 raise WorkspaceError(f"Generated test escapes execution workspace: {path}")
-            ast.parse(proposal.test_code, filename=path)
+            tree = ast.parse(proposal.test_code, filename=path)
+            try:
+                validate_python_source_paths(tree, proposal.target_source_file)
+            except ValueError as exc:
+                raise WorkspaceError(f"Invalid source path in {path}: {exc}") from exc
             with target.open("x", encoding="utf-8", newline="\n") as test_file:
                 test_file.write(proposal.test_code)
             target.chmod(0o444)

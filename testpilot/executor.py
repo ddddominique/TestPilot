@@ -7,7 +7,7 @@ import subprocess
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -242,6 +242,19 @@ class TestExecutor:
         self.docker = docker
 
     def execute(
+        self,
+        pull_request: PullRequest,
+        detection: FrameworkDetection,
+        generation: GenerationResult,
+    ) -> ExecutionResult:
+        result = self._execute(pull_request, detection, generation)
+        return replace(
+            result, framework_selection=detection.selection,
+            framework_evidence=list(detection.evidence),
+            warnings=list(detection.warnings) + result.warnings,
+        )
+
+    def _execute(
         self,
         pull_request: PullRequest,
         detection: FrameworkDetection,

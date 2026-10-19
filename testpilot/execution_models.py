@@ -87,6 +87,8 @@ class ExecutionResult:
     error: str = ""
     warnings: list[str] = field(default_factory=list)
     docker_started: bool = False
+    framework_selection: str = "detected"
+    framework_evidence: list[str] = field(default_factory=list)
 
     @property
     def successful(self) -> bool:

@@ -127,3 +127,11 @@ def test_rejects_symlink_traversal_during_materialization(tmp_path):
     (generated / "tests").symlink_to(outside, target_is_directory=True)
     with pytest.raises(WorkspaceError, match="symlink"):
         manager._materialize_tests(source, generated, generation(proposal()))
+
+
+def test_materialization_rejects_colocated_source_path_before_execution():
+    item = proposal(code='from pathlib import Path\nsource = Path(__file__).with_name("app.py")\n')
+    with pytest.raises(WorkspaceError, match="TESTPILOT_SOURCE_ROOT"):
+        WorkspaceManager(FakeGitHub(archive_bytes({"app.py": "value = 1"}))).prepare(
+            pr(), generation(item)
+        )

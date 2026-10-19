@@ -10,7 +10,7 @@ from typing import Any, Optional
 from openai import OpenAI, OpenAIError
 from pydantic import ValidationError
 
-from .generation_models import FrameworkDetection, GenerationResult
+from .generation_models import FrameworkDetection, GenerationResult, validate_python_source_paths
 from .models import CollectedContext, PullRequest
 
 
@@ -24,6 +24,26 @@ Every proposal must be the complete contents of a NEW, standalone test module, i
 imports. Never assume code will be appended to an existing test file. Do not rely on helpers defined only
 inside another test module unless the context proves they are importable. Never invent APIs, imports,
 dependencies, functions, classes, fixtures, or module paths. Prefer repository-supported public APIs.
+EXECUTION FILESYSTEM CONTRACT: repository sources are mounted read-only at /workspace/repo;
+generated test modules are mounted separately at /workspace/generated/<suggested_test_file>.
+Their directory structure does NOT colocate tests with source files. The trusted pytest runner sets
+TESTPILOT_SOURCE_ROOT=/workspace/repo. For source-file access use
+Path(os.environ["TESTPILOT_SOURCE_ROOT"]) / "<exact repository-relative source path>".
+Do not derive source paths from __file__, Path(__file__).with_name(...), or the generated-test directory.
+Normal supported Python package imports remain preferred: the runner adds the repository root and
+its src/ directory to sys.path. For a standalone file whose name is not a Python identifier, such as
+leetcode/2089.py, use a complete loader like this (replace the source path with the allowed target):
+import importlib.util
+import os
+from pathlib import Path
+import sys
+source_path = Path(os.environ["TESTPILOT_SOURCE_ROOT"]) / "leetcode/2089.py"
+spec = importlib.util.spec_from_file_location("testpilot_target_2089", source_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+Then test module.Solution or other APIs actually present in the provided source. Include the loader
+and all required imports in the proposal; the runner does not inject test helpers or source symbols.
 Return proposals only; do not execute code or claim that generated tests pass."""
 
 TRUNCATION_MARKER = "\n[TRUNCATED: ADDITIONAL CONTEXT OMITTED BY LLM INPUT BUDGET]"
@@ -73,6 +93,7 @@ def format_generation_context(
         _render_section(
             "DETECTED FRAMEWORK",
             f"language: {detection.language}\nframework: {detection.framework}\n"
+            f"selection: {detection.selection}\n"
             + "\n".join(f"evidence: {item}" for item in detection.evidence),
         ),
         _render_section(
@@ -253,9 +274,15 @@ class TestGenerator:
                 )
             if detection.framework == "pytest":
                 try:
-                    ast.parse(proposal.test_code, filename=proposal.suggested_test_file)
+                    tree = ast.parse(proposal.test_code, filename=proposal.suggested_test_file)
                 except SyntaxError as exc:
                     location = f"line {exc.lineno}" if exc.lineno else "unknown line"
                     raise GeneratedCodeValidationError(
                         f"Generated Python test is not valid syntax at {location}: {exc.msg}"
+                    ) from exc
+                try:
+                    validate_python_source_paths(tree, proposal.target_source_file)
+                except ValueError as exc:
+                    raise GeneratedCodeValidationError(
+                        f"Invalid source path in {proposal.suggested_test_file}: {exc}"
                     ) from exc

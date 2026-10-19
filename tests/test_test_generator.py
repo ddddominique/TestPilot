@@ -7,6 +7,7 @@ from openai import OpenAIError
 from pydantic import ValidationError
 
 from testpilot.generation_models import FrameworkDetection, GenerationResult, TestProposal
+from testpilot.framework_detector import select_framework
 from testpilot.models import ChangedFile, CollectedContext, ContextFile, ContextPatch, PullRequest
 from testpilot.test_generator import (
     ContextFormattingError,
@@ -351,3 +352,99 @@ def test_large_patch_does_not_starve_source_config_and_test_sections():
     assert "category=config path=pyproject.toml" in output
     assert "category=test path=tests/test_parser.py" in output
     assert len(output) <= 1_200
+
+
+def test_inferred_pytest_selection_reaches_prompt_and_strict_validation():
+    context = replace(
+        make_context(),
+        relevant_source_files=["leetcode/2089.py"],
+        files=[ContextFile("leetcode/2089.py", "source", "class Solution: pass")],
+    )
+    selection = select_framework(context)
+    expected = GenerationResult(
+        summary="Python-only solution tests",
+        proposals=[proposal(path="tests/test_2089.py", target="leetcode/2089.py")], warnings=[],
+    )
+    client = Mock()
+    client.chat.completions.parse.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(parsed=expected, refusal=None))]
+    )
+    assert TestGenerator(client=client).generate(make_pr(), context, selection) == expected
+    prompt = client.chat.completions.parse.call_args.kwargs["messages"][1]["content"]
+    assert "selection: inferred" in prompt
+    assert "framework: pytest" in prompt
+    assert "All relevant changed source files are Python: leetcode/2089.py" in prompt
+    assert "No supported framework evidence was found" in prompt
+
+    wrong_framework = proposal(path="tests/generated.test.ts", target="leetcode/2089.py", framework="jest")
+    with pytest.raises(GeneratedCodeValidationError, match="expected pytest"):
+        TestGenerator(client=client)._validate_result(
+            GenerationResult(summary="wrong", proposals=[wrong_framework], warnings=[]), selection, context
+        )
+
+
+@pytest.mark.parametrize("expression", [
+    'Path(__file__).with_name("2089.py")',
+    'Path(__file__).parent / "2089.py"',
+    'Path(__file__).resolve().parent / "leetcode" / "2089.py"',
+    'os.path.join(os.path.dirname(__file__), "2089.py")',
+    'Path("/workspace/generated/leetcode/2089.py")',
+    'HERE / SOURCE_NAME',
+])
+def test_rejects_source_paths_based_on_generated_test_location(expression):
+    context = replace(make_context(), relevant_source_files=["leetcode/2089.py"])
+    item = proposal(path="leetcode/test_2089.py", target="leetcode/2089.py").model_copy(update={
+        "test_code": (
+            'from pathlib import Path\nimport os\n'
+            'HERE = Path(__file__).parent\nSOURCE_NAME = "2089.py"\n'
+            f'source = {expression}\n'
+            'def test_solution():\n    assert source.exists()\n'
+        ),
+    })
+    with pytest.raises(GeneratedCodeValidationError, match="TESTPILOT_SOURCE_ROOT.*mounted separately"):
+        TestGenerator(client=Mock())._validate_result(
+            GenerationResult(summary="incorrect path", proposals=[item], warnings=[]),
+            FrameworkDetection("python", "pytest"), context,
+        )
+
+
+@pytest.mark.parametrize("target", ["leetcode/2089.py", "solutions/python/leetcode/2089.py"])
+def test_accepts_numeric_standalone_source_loaded_from_stable_repository_root(target):
+    context = replace(make_context(), relevant_source_files=[target])
+    code = (
+        'import importlib.util\nimport os\nfrom pathlib import Path\nimport sys\n'
+        f'source_path = Path(os.environ["TESTPILOT_SOURCE_ROOT"]) / {target!r}\n'
+        'spec = importlib.util.spec_from_file_location("solution_under_test", source_path)\n'
+        'module = importlib.util.module_from_spec(spec)\n'
+        'sys.modules[spec.name] = module\n'
+        'spec.loader.exec_module(module)\n'
+        'def test_solution():\n    assert module.Solution is not None\n'
+    )
+    item = proposal(path="tests/generated/test_2089.py", target=target).model_copy(update={"test_code": code})
+    expected = GenerationResult(summary="standalone solution", proposals=[item], warnings=[])
+    client = Mock()
+    client.chat.completions.parse.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(parsed=expected, refusal=None))]
+    )
+    assert TestGenerator(client=client).generate(
+        make_pr(), context, select_framework(context)
+    ) == expected
+    instructions = client.chat.completions.parse.call_args.kwargs["messages"][0]["content"]
+    assert "/workspace/repo" in instructions
+    assert "/workspace/generated/<suggested_test_file>" in instructions
+    assert "TESTPILOT_SOURCE_ROOT" in instructions
+    assert "spec_from_file_location" in instructions
+
+
+def test_preserves_package_imports_and_test_local_fixture_paths():
+    item = proposal().model_copy(update={
+        "test_code": (
+            'from pathlib import Path\nfrom src.parser import parse\n'
+            'FIXTURE = Path(__file__).with_name("input.json")\n'
+            'def test_parse():\n    assert parse("") == ""\n'
+        ),
+    })
+    TestGenerator(client=Mock())._validate_result(
+        GenerationResult(summary="package and fixture", proposals=[item], warnings=[]),
+        FrameworkDetection("python", "pytest"), make_context(),
+    )

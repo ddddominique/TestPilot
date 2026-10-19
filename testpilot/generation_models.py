@@ -1,5 +1,6 @@
 """Validated models for framework detection and generated test proposals."""
 
+import ast
 import re
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
@@ -8,12 +9,75 @@ from typing import ClassVar
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+def validate_python_source_paths(tree: ast.AST, target_source_file: str) -> None:
+    """Reject recognizable source/test colocation mistakes without executing code.
+
+    This is deliberately a small static check, not a Python data-flow analyzer.
+    Resolve single-assignment aliases to catch common HERE / SOURCE_NAME patterns;
+    leave dynamic expressions and ambiguous reassignments to isolated execution.
+    """
+    assignments: dict[str, ast.AST] = {}
+    repeated: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and value is not None:
+                if target.id in assignments:
+                    repeated.add(target.id)
+                assignments[target.id] = value
+    for name in repeated:
+        assignments.pop(name, None)
+
+    def references(node: ast.AST) -> tuple[bool, set[str]]:
+        uses_test_location = False
+        strings: set[str] = set()
+        pending = [node]
+        seen: set[str] = set()
+        while pending:
+            for child in ast.walk(pending.pop()):
+                if isinstance(child, ast.Constant) and isinstance(child.value, str):
+                    strings.add(child.value)
+                elif isinstance(child, ast.Name):
+                    if child.id == "__file__":
+                        uses_test_location = True
+                    elif child.id in assignments and child.id not in seen:
+                        seen.add(child.id)
+                        pending.append(assignments[child.id])
+        return uses_test_location, strings
+
+    basename = PurePosixPath(target_source_file).name
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Call, ast.BinOp)):
+            continue
+        uses_test_location, strings = references(node)
+        targets_source = any(
+            value == basename or value == target_source_file or value.endswith("/" + basename)
+            for value in strings
+        )
+        generated_source = any(
+            value.startswith("/workspace/generated/") and PurePosixPath(value).name == basename
+            for value in strings
+        )
+        if generated_source or (uses_test_location and targets_source):
+            raise ValueError(
+                f"source {target_source_file!r} must be resolved from "
+                'Path(os.environ["TESTPILOT_SOURCE_ROOT"]) using its full repository-relative path; '
+                "generated tests and repository sources are mounted separately"
+            )
+
+
 @dataclass(frozen=True)
 class FrameworkDetection:
     language: str
     framework: str
     evidence: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    selection: str = "detected"
 
     @property
     def is_supported(self) -> bool:

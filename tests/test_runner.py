@@ -9,7 +9,8 @@ import pytest
 
 
 @pytest.fixture
-def runner():
+def runner(monkeypatch):
+    monkeypatch.delenv("TESTPILOT_SOURCE_ROOT", raising=False)
     path = Path(__file__).parents[1] / "runner" / "pytest_runner.py"
     spec = importlib.util.spec_from_file_location("trusted_pytest_runner", path)
     module = importlib.util.module_from_spec(spec)
@@ -24,6 +25,7 @@ def runner():
 ])
 def test_trusted_runner_classification(runner, monkeypatch, capsys, outcome, expected):
     def fake_pytest(args, plugins):
+        assert runner.os.environ["TESTPILOT_SOURCE_ROOT"] == "/workspace/repo"
         assert "--noconftest" in args
         assert args[args.index("-c") + 1] == "/dev/null"
         assert args[-1] == "/workspace/generated/test_fixture.py"

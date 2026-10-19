@@ -120,3 +120,42 @@ def test_execution_summary_identifies_exact_head_and_counts():
     assert "a/b#2" in output
     assert "Head commit: abc123" in output
     assert "2 passed, 0 failed, 1 skipped" in output
+
+
+@pytest.mark.parametrize("override,expected", [(None, "inferred"), ("pytest", "override")])
+def test_cli_selects_framework_for_coding_exercise_pr(monkeypatch, capsys, override, expected):
+    pr = PullRequest("ddddominique", "Coding-Exercise", 1, "Add solution", "", "base", "head", [])
+    collected = CollectedContext(
+        [ContextFile("leetcode/2089.py", "source", "class Solution: pass")],
+        ["leetcode/2089.py"], [], [], [], repository_files=["old.cpp", "leetcode/2089.py"],
+    )
+    github = Mock()
+    github.get_pull_request.return_value = pr
+    collector = Mock()
+    collector.collect.return_value = collected
+    generator = Mock()
+    generator.generate.return_value = GenerationResult(summary="proposal", proposals=[], warnings=[])
+    monkeypatch.setattr("testpilot.cli.GitHubClient", lambda: github)
+    monkeypatch.setattr("testpilot.cli.ContextCollector", lambda *args: collector)
+    monkeypatch.setattr("testpilot.cli.TestGenerator", lambda **kwargs: generator)
+    arguments = ["--pr", "https://github.com/ddddominique/Coding-Exercise/pull/1", "--generate-tests"]
+    if override:
+        arguments += ["--framework", override]
+    assert main(arguments) == 0
+    selected = generator.generate.call_args.args[2]
+    assert selected.framework == "pytest"
+    assert selected.selection == expected
+    assert f"Framework selection: {expected}" in capsys.readouterr().out
+
+
+def test_cli_rejects_incompatible_override_before_generation(monkeypatch, capsys):
+    github = Mock()
+    collector = Mock()
+    collector.collect.return_value = CollectedContext([], ["app.py"], [], [], [])
+    generator = Mock()
+    monkeypatch.setattr("testpilot.cli.GitHubClient", lambda: github)
+    monkeypatch.setattr("testpilot.cli.ContextCollector", lambda *args: collector)
+    monkeypatch.setattr("testpilot.cli.TestGenerator", generator)
+    assert main(["--pr", "https://github.com/a/b/pull/1", "--generate-tests", "--framework", "jest"]) == 1
+    assert "incompatible" in capsys.readouterr().err
+    generator.assert_not_called()
