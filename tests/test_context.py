@@ -96,3 +96,36 @@ def test_tree_failure_falls_back_to_changed_files():
     context = ContextCollector(client).collect(make_pr())
     assert [item.path for item in context.files] == ["src/parser.py"]
     assert any("Could not list" in warning for warning in context.warnings)
+
+
+def test_new_test_prefixed_module_inside_python_package_is_changed_source():
+    client = FakeClient()
+    client.contents = {
+        "testpilot/__init__.py": "",
+        "testpilot/test_generator.py": "class TestGenerator: pass",
+        "tests/test_test_generator.py": "def test_generator(): pass",
+        "pyproject.toml": "[tool.pytest.ini_options]",
+    }
+    pr = PullRequest(
+        "acme", "widget", 2, "Add generation", "", "base", "head",
+        [
+            ChangedFile(
+                "testpilot/test_generator.py", "added", 20, 0, 20,
+                "+class TestGenerator: pass",
+            ),
+            ChangedFile(
+                "tests/test_test_generator.py", "added", 10, 0, 10,
+                "+def test_generator(): pass",
+            ),
+        ],
+    )
+
+    context = ContextCollector(client).collect(pr)
+
+    assert "testpilot/test_generator.py" in context.relevant_source_files
+    assert "testpilot/test_generator.py" not in context.existing_tests
+    assert "tests/test_test_generator.py" in context.existing_tests
+    assert any(
+        item.path == "testpilot/test_generator.py" and item.category == "source"
+        for item in context.files
+    )
