@@ -4,14 +4,14 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID, uuid4
 
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, Float, Index, Integer, JSON, String, Text, Uuid, func, text
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, Uuid, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from testpilot.execution_models import ExecutionStatus
 
 
-RUN_STATUSES = ["PENDING", "RUNNING", "COMPLETED", "FAILED"]
+RUN_STATUSES = ["PENDING", "QUEUED", "RUNNING", "COMPLETED", "FAILED"]
 
 
 class Base(DeclarativeBase):
@@ -44,6 +44,8 @@ class TestRunRecord(Base):
     status: Mapped[str] = mapped_column(String(32), default="PENDING", server_default="PENDING")
     framework: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     execution_outcome: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    queued_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    task_id: Mapped[Optional[UUID]] = mapped_column(Uuid, nullable=True, unique=True)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     exit_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -65,3 +67,15 @@ class TestRunRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(),
     )
+
+
+class RunDispatch(Base):
+    """Durable outbox: one dispatch intent per run, retained for diagnosis."""
+
+    __tablename__ = "run_dispatches"
+    run_id: Mapped[UUID] = mapped_column(ForeignKey("test_runs.id"), primary_key=True)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    lease_token: Mapped[Optional[UUID]] = mapped_column(Uuid, nullable=True)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_error: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)

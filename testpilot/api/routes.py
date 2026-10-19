@@ -1,13 +1,12 @@
-"""REST routes for persistent runs and explicit synchronous execution."""
+"""REST routes for persistent runs and durable asynchronous submission."""
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
 from .database import get_session
 from .repository import RunRepository, RunConflict, RunNotFound
-from .run_service import execute_run
 from .schemas import CreateRunRequest, HealthResponse, RunPage, RunResponse
 
 
@@ -45,12 +44,13 @@ def get_run(run_id: UUID, session: Session = Depends(get_session)):
     return record
 
 
-@router.post("/api/runs/{run_id}/execute", response_model=RunResponse)
-def execute_existing_run(run_id: UUID, request: Request):
-    # This route deliberately does not depend on get_session: only the claim
-    # and result writes own short sessions, never the network/LLM/Docker work.
+@router.post("/api/runs/{run_id}/execute", response_model=RunResponse, status_code=status.HTTP_202_ACCEPTED)
+def execute_existing_run(run_id: UUID, response: Response, session: Session = Depends(get_session)):
+    # Publication belongs to the outbox dispatcher, never a request process.
     try:
-        return execute_run(run_id, request.app.state.session_factory, request.app.state.pipeline_factory)
+        record = RunRepository(session).queue(run_id)
+        response.headers["Location"] = f"/api/runs/{record.id}"
+        return record
     except RunNotFound:
         raise HTTPException(status_code=404, detail="Run not found")
     except RunConflict:

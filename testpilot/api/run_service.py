@@ -17,20 +17,22 @@ def sanitized(value: str, limit: Optional[int]) -> str:
     """Redact text; None disables truncation for whole-module size checks."""
     if not isinstance(value, str):
         value = "[INVALID DIAGNOSTIC]" if value is not None else ""
-    for key in ("OPENAI_API_KEY", "GITHUB_TOKEN", "DATABASE_URL"):
+    for key in ("OPENAI_API_KEY", "GITHUB_TOKEN", "DATABASE_URL", "CELERY_BROKER_URL"):
         secret = os.getenv(key)
         if secret:
             value = value.replace(secret, "[REDACTED]")
-    try:
-        password = urlsplit(os.getenv("DATABASE_URL", "")).password
-        if password:
-            value = value.replace(unquote(password), "[REDACTED]")
-    except ValueError:
-        pass
+    for key in ("DATABASE_URL", "CELERY_BROKER_URL"):
+        try:
+            password = urlsplit(os.getenv(key, "")).password
+            if password:
+                value = value.replace(unquote(password), "[REDACTED]")
+        except ValueError:
+            pass
     value = re.sub(r"(?i)(Bearer\s+)\S+", r"\1[REDACTED]", value)
     value = re.sub(r"(?im)(Authorization\s*:\s*)[^\r\n]+", r"\1[REDACTED]", value)
     value = re.sub(r"(?:sk-[A-Za-z0-9_-]+|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)", "[REDACTED]", value)
     value = re.sub(r"(postgres(?:ql)?(?:\+psycopg)?://)[^\s/@]+:[^\s/@]+@", r"\1[REDACTED]@", value)
+    value = re.sub(r"(rediss?://)[^\s/@]*:[^\s/@]+@", r"\1[REDACTED]@", value)
     value = value.replace("\x00", "")
     raw = value.encode("utf-8", errors="replace")
     if limit is None or len(raw) <= limit:
@@ -131,9 +133,9 @@ def result_values(result: PipelineResult, failure_stage=None) -> dict:
     return values
 
 
-def execute_run(run_id, sessions, pipeline_factory):
+def execute_run(run_id, sessions, pipeline_factory, task_id):
     with sessions() as session:
-        record = RunRepository(session).claim(run_id)
+        record = RunRepository(session).claim(run_id, task_id)
         pr_url = record.pr_url
     # No ORM object, session, or checked-out connection reaches the pipeline.
     try:

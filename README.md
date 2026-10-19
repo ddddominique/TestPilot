@@ -7,6 +7,7 @@ TestPilot is an AI-powered pull-request testing agent. It currently implements:
 - **Phase 3:** opt-in execution of generated pytest modules against an exact PR head snapshot inside Docker.
 - **Phase 4.1:** a FastAPI REST API that persists pending runs in PostgreSQL.
 - **Phase 4.2:** explicit synchronous pipeline execution with persistent lifecycle and results.
+- **Phase 5:** asynchronous API execution via a PostgreSQL outbox, Redis, and Celery workers (replaces synchronous HTTP execution).
 
 Without `--execute`, generated tests remain proposals only. Execution materializes them in temporary storage outside your project. TestPilot never modifies the target repository, creates commits, or posts PR comments. Webhooks and a frontend are not implemented.
 
@@ -255,7 +256,7 @@ The database is PostgreSQL 17, bound only to `127.0.0.1:5432`, with a health che
 | --- | --- |
 | `GET /health` | `200 {"status":"ok"}`; basic process liveness, not database readiness |
 | `POST /api/runs` | Accepts `{"pr_url":"https://github.com/owner/repo/pull/123"}`; returns `201` with the UUID, `PENDING` status, and run fields; includes a `Location` header |
-| `POST /api/runs/{run_id}/execute` | Synchronously executes a pending run and returns `200` with the final lifecycle and execution outcome; `404` if missing, `409` if already started |
+| `POST /api/runs/{run_id}/execute` | Durably queues a pending run and returns `202`, job ID, `QUEUED` status, and a `Location` header; `404` if missing, `409` if already queued/started/finished |
 | `GET /api/runs/{run_id}` | Returns the run; unknown UUIDs return `404` |
 | `GET /api/runs?limit=20&offset=0` | Returns `{items,total,limit,offset}`, ordered by creation time descending with UUID tie-breaking |
 
@@ -280,7 +281,7 @@ API architecture:
 - `repository.py`: transactional create, lookup, pagination, atomic claim, and finalization operations.
 - `run_service.py`: short persistence transactions around the shared synchronous pipeline, plus bounded/sanitized stored results.
 - `routes.py`: HTTP routing, status codes, and pagination bounds.
-- `migrations/`: Alembic schema revisions. Initial migration: `0001_create_test_runs`; lifecycle migration: `0002_run_lifecycle`.
+- `migrations/`: Alembic revisions `0001_create_test_runs`, `0002_run_lifecycle`, and `0003_async_dispatch`. Earlier revisions are unchanged.
 
 Write transactions commit before returning HTTP 201; exceptions roll back. Sessions close after every request and the application disposes its engine on shutdown. `updated_at` is maintained on SQLAlchemy updates; direct SQL writers must update it explicitly. Head SHA, framework, output, and errors remain null on pending records, counts start at zero, and generated-test metadata starts as an empty JSON array.
 
@@ -304,24 +305,25 @@ python -m pytest -q tests/test_api_postgres.py
 
 That opt-in test creates a uniquely named temporary schema, applies the real Alembic migration, checks API persistence/JSONB/rollback, and drops only its temporary schema afterward. It requires schema-creation privileges and is skipped unless the test URL is provided.
 
-There is no authentication, authorization, background processing, frontend, or automatic execution on creation. Keep this API on localhost for development. Offset-based pagination may shift between requests during concurrent inserts. `/health` does not verify that PostgreSQL is reachable or migrations are current.
+There is no authentication, authorization, frontend, or automatic execution on creation. Keep this API on localhost for development. Offset-based pagination may shift between requests during concurrent inserts. `/health` does not verify PostgreSQL, Redis, worker readiness, or migration state.
 
 ## Phase 4.2: persistent pipeline execution
 
-`testpilot/pipeline.py` is the shared orchestrator for the CLI and API. It reuses GitHub retrieval, bounded context collection, framework selection/inference, structured test generation, and the hardened Docker executor. Component factories are injectable for offline tests. Partial metadata is retained when a stage fails. CLI options, formatting, and exit codes remain supported, including context-only and generation-only runs, `--framework`, and opt-in `--execute`.
+`testpilot/pipeline.py` is the shared orchestrator for the CLI and background worker. It reuses GitHub retrieval, bounded context collection, framework selection/inference, structured test generation, and the hardened Docker executor. Component factories are injectable for offline tests. Partial metadata is retained when a stage fails. CLI options, formatting, and exit codes remain supported, including context-only and generation-only runs, `--framework`, and opt-in `--execute`. The CLI remains synchronous and needs neither Redis nor PostgreSQL.
 
 Lifecycle status and execution outcome are distinct:
 
 | Lifecycle | Meaning |
 | --- | --- |
 | `PENDING` | Created, not claimed |
+| `QUEUED` | Durable dispatch intent committed; not yet claimed by a worker |
 | `RUNNING` | Atomically claimed; pipeline underway |
 | `COMPLETED` | Attempt finished with a recorded execution outcome |
 | `FAILED` | Orchestration failed or the executor reported `INFRASTRUCTURE_ERROR` |
 
 For example, failing assertions are `COMPLETED` with `execution_outcome="TEST_FAILED"`. Collection, syntax, dependency, timeout, and unsupported outcomes also complete the attempt with their granular outcome. Cleanup/infrastructure failures yield `FAILED / INFRASTRUCTURE_ERROR`. A failure before execution can have a null execution outcome, with an allowlisted stage diagnostic instead of a raw exception. Pipeline completion does not imply that tests passed.
 
-Execution claims use a conditional SQL update from `PENDING` to `RUNNING`. Only one request can win. The claim commits and its session closes before any GitHub, LLM, or Docker work. A second short transaction stores the head SHA, framework selection/evidence, generated code, execution outcome, counts, output, diagnostics, and start/completion timestamps. No database connection remains checked out throughout pipeline execution. Repeated requests—including retries after a failed attempt—return 409; create a new run for a deliberate retry.
+Execution now uses `PENDING → QUEUED → RUNNING → COMPLETED / FAILED`. The API atomically changes `PENDING` to `QUEUED`, assigns `task_id` and `queued_at`, and inserts a `run_dispatches` outbox row in the same transaction. A separate dispatcher publishes the run ID to Redis. The worker atomically claims `QUEUED → RUNNING` only with the matching job ID. Claims commit and sessions close before GitHub, LLM, or Docker work. A second short transaction stores results. Repeated requests—including retries after a failed attempt—return 409; create a new run for a deliberate retry.
 
 Migration `0002_run_lifecycle` preserves existing pending rows and maps legacy terminal status values into lifecycle plus execution outcome. The original migration is unchanged. Legacy terminal timestamps are backfilled from the previous creation/update timestamps. Apply migrations to an existing Phase 4.1 database before starting this version:
 
@@ -343,19 +345,69 @@ curl http://127.0.0.1:8000/api/runs/RUN_UUID
 curl 'http://127.0.0.1:8000/api/runs?limit=10&offset=0'
 ```
 
-The execute endpoint returns HTTP 200 when the attempt is recorded, even if tests fail or lifecycle is `FAILED`; inspect both status fields. Database errors return 503. Generation/execution remain explicit; only pytest executes and the existing sandbox/source-root/provenance controls remain in force.
+The execute endpoint returns HTTP 202 promptly after the database commit, not after tests run. Follow `Location` or poll GET to see the outcome. Database errors return sanitized 503 responses; a commit acknowledgement can be uncertain, so GET before submitting again. Broker downtime does not reject accepted work: it remains visibly `QUEUED` until publication and worker claim succeed. Generation/execution remain explicit; only pytest executes and the existing sandbox/source-root/provenance controls remain in force.
 
 Stored generated-test metadata is limited to 20 proposals and 400 KB, checked before and after sanitization (including integrity metadata). Complete module code is retained exactly when safe. Every stored proposal includes `test_code_sha256`, the SHA-256 of the original generated UTF-8 source, and `test_code_representation`: `original` means byte-identical source; `redacted_display` means display-only modified text, not the executed module. These fields identify source content, not proof that execution completed. Oversized or invalidly encoded metadata is omitted with a warning rather than saved as incomplete executable code. Output is capped at 64 KB, summaries/errors at 8 KB each, warnings at 64 entries of 2 KB, and evidence at 32 entries of 2 KB. No repository snapshot or collected source context is persisted. Configured API/database credentials and common token/header forms are redacted from stored text. Raw orchestration exception messages are not persisted. Redaction is best-effort for arbitrary secrets embedded in repository content; do not treat stored output as safe for public disclosure.
 
-### Development-only synchronous execution
+## Phase 5: local asynchronous execution
 
-Execution blocks a request worker until the existing pipeline stages finish. Existing network and Docker timeouts apply, but there is no additional whole-request deadline or durable task supervisor. A client/proxy timeout does not guarantee cancellation. A server crash, forced reload, or failed final database commit can leave a record `RUNNING`; the latter returns 503 and does not permit duplicate execution. There is no automatic recovery or retry. Avoid server reloads while a run is executing. Phase 5 will introduce Redis/Celery job processing and address durable recovery, worker supervision, cancellation, and retry policy.
+```text
+API → PostgreSQL QUEUED + outbox → dispatcher → Redis → Celery worker
+                                                        ↓
+                                      PipelineService → Docker sandbox
+                                                        ↓
+                                              PostgreSQL results ← GET polling
+```
+
+PostgreSQL is the source of truth; Redis is only a delivery mechanism. There is no Celery result backend. Queued means the database accepted the intent; it does not imply publication, a live worker, or pipeline execution. `started_at` is set only by a winning worker claim; `completed_at` records terminal persistence. `task_id` remains stable across publication retries and duplicate messages.
+
+### Startup on macOS / Docker Desktop
+
+Install requirements and export `.env` as above. Replace placeholder API keys before execution. Docker Desktop must be running and the trusted runner image must be built locally. Run the worker and dispatcher from the host virtualenv: this avoids mounting the host Docker socket into another container and preserves existing source-root mount paths.
+
+```bash
+docker compose up -d --wait postgres redis
+python -m alembic upgrade head
+python -m testpilot.build_runner
+# Terminal 1 (API needs DATABASE_URL, but not LLM credentials):
+python -m uvicorn testpilot.api.app:app --host 127.0.0.1 --port 8000
+# Terminal 2 (export DATABASE_URL and CELERY_BROKER_URL):
+python -m testpilot.worker.dispatcher
+# Terminal 3 (also export OPENAI_API_KEY and optional GITHUB_TOKEN/OPENAI_MODEL):
+python -m celery -A testpilot.worker.celery_app:app worker --pool=prefork --concurrency=1 --loglevel=INFO
+# Terminal 4: create, submit, and poll:
+curl -X POST http://127.0.0.1:8000/api/runs -H 'Content-Type: application/json' \
+  -d '{"pr_url":"https://github.com/ddddominique/Coding-Exercise/pull/1"}'
+curl -i -X POST http://127.0.0.1:8000/api/runs/RUN_UUID/execute
+curl http://127.0.0.1:8000/api/runs/RUN_UUID
+docker compose logs -f postgres redis
+```
+
+Worker/dispatcher logs stream to their terminals. The dispatcher must run alongside the worker; queued records remain durable while it is stopped. Compose binds PostgreSQL and Redis only to loopback. Redis uses a persistent named volume and AOF `everysec`, but is not an exactly-once broker. `CELERY_BROKER_URL` defaults to `redis://127.0.0.1:6379/0`. Keep all processes' clocks synchronized.
+
+### Delivery, failure, and recovery policy
+
+- API failure before commit leaves neither queued state nor an outbox intent. Failure after commit leaves durable dispatch, regardless of whether the client received 202.
+- Dispatcher leases use conditional database updates. The lease commits before publishing, with no connection held during broker I/O. Multiple dispatchers may run safely. A crashed lease becomes available after 60 seconds.
+- Queued jobs are republished every 60 seconds until claimed, including after an apparently successful publication. This handles Redis message loss and crashes before/after broker publication. Duplicate transport messages are expected; a job ID is not itself a deduplication guarantee. Database state plus job identity fence execution.
+- Broker failures retain the outbox row and a generic `last_error`; credentials/raw exceptions are not stored. Inspect `run_dispatches` (`attempts`, `available_at`, `published_at`, `last_error`) for dispatch diagnosis. SQL failures leave committed intents available after the lease. Dispatcher retries concern delivery only.
+- Celery acknowledges early (`task_acks_late=False`), prefetches one, defaults to concurrency one, accepts JSON only, ignores task results, and disables remote control. Task retries are zero; publish retries are disabled within a publication attempt. Redis socket/connect timeouts are 3 seconds; worker broker reconnect attempts are capped at 10. Restart the worker after that budget is exhausted.
+- Prefork tasks have a 1,740-second soft limit and a 1,800-second hard limit. Use prefork, not solo/gevent, for execution time-limit enforcement. TERM performs warm shutdown: allow active work to finish before stopping services. Forced termination/hard limits can bypass Docker cleanup; inspect `docker ps -a --filter name=testpilot-` and manually remove confirmed orphaned containers with `docker rm -f CONTAINER_NAME`.
+- If a worker dies before claiming, the queued job is safely delivered again. After claiming, duplicate deliveries never restart the pipeline. Crashes or final result commit failures can leave `RUNNING` with an unknown outcome. Database finalization is not automatically retried and external operations are never implicitly repeated.
+- Run reconciliation periodically or after a worker/database outage: `python -m testpilot.worker.reconcile --running-age-seconds 3600`. It atomically marks stale `RUNNING` attempts `FAILED / INFRASTRUCTURE_ERROR` with an explicit outcome-unknown diagnostic, never PASSED or eligible for execution again. The minimum age is 2,400 seconds, above the hard limit. This is a time-based administrative decision, not proof the old worker stopped. Stop/inspect suspected workers and orphan containers before deliberately retrying with a **new run**. Late result commits are fenced once reconciliation wins. Existing Phase 4.2 RUNNING rows with start timestamps are covered too.
+- Queued recovery is automatic while the dispatcher runs; stale-running reconciliation is an explicit command, not an automatic execution retry. `python -m testpilot.worker.dispatcher --once` attempts one available publication for diagnosis.
+
+The worker and broker are trusted infrastructure. Docker daemon access is host-level authority; do not expose the worker, Redis, or PostgreSQL to untrusted users. Generated-test containers retain network isolation, non-root execution, read-only filesystem, resource/time limits, bounded output, and no credentials or Docker socket. API keys are needed only by the worker (and CLI), never the generated container. Celery 5.5's Redis transport is the only new dependency group. See the [Celery configuration reference](https://docs.celeryq.dev/en/v5.5.3/userguide/configuration.html) and [Redis delivery caveats](https://docs.celeryq.dev/en/v5.5.3/getting-started/backends-and-brokers/redis.html).
+
+Shutdown: send TERM/Ctrl-C to the worker and let it finish, stop the dispatcher/API, then run `docker compose down`. Volumes are retained. Do not use `down -v` unless intentionally deleting local data. Cancellation, authentication, production supervision, automatic reconciliation scheduling, and job retention/archiving are not implemented.
 
 ```bash
 python -m pytest -q
-python -m pytest -q tests/test_pipeline.py tests/test_run_lifecycle.py tests/test_lifecycle_migration.py
-# Dedicated PostgreSQL test database only; applies both real migrations:
+python -m pytest -q tests/test_async_jobs.py tests/test_async_migration.py tests/test_pipeline.py tests/test_run_lifecycle.py
+# Dedicated PostgreSQL test database only; applies all real migrations:
 TESTPILOT_TEST_DATABASE_URL="$DATABASE_URL" python -m pytest -q tests/test_api_postgres.py
+# Dedicated Redis test broker; unique test queue, mocked pipeline, SQLite persistence:
+TESTPILOT_TEST_REDIS_URL=redis://127.0.0.1:6379/15 python -m pytest -q tests/test_worker_redis.py
 ```
 
 Routine tests mock pipeline boundaries and exercise transactions/concurrency using an isolated SQLite database. PostgreSQL integration remains optional and is required to verify actual PostgreSQL behavior; neither a skipped integration test nor offline SQL generation establishes that a live migration passed.

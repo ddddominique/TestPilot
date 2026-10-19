@@ -1,14 +1,14 @@
 """Persistence operations only; no GitHub, LLM, or Docker calls."""
 
 from typing import Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from testpilot.github import GitHubClient
 
-from .db_models import TestRunRecord
+from .db_models import RunDispatch, TestRunRecord
 
 
 class RunNotFound(Exception):
@@ -38,11 +38,27 @@ class RunRepository:
     def get(self, run_id: UUID) -> Optional[TestRunRecord]:
         return self.session.get(TestRunRecord, run_id)
 
-    def claim(self, run_id: UUID) -> TestRunRecord:
+    def queue(self, run_id: UUID) -> TestRunRecord:
+        """Commit eligibility transition and durable dispatch intent together."""
         with self.session.begin():
             row = self.session.scalars(
                 update(TestRunRecord)
                 .where(TestRunRecord.id == run_id, TestRunRecord.status == "PENDING")
+                .values(status="QUEUED", queued_at=func.now(), task_id=uuid4(), updated_at=func.now())
+                .returning(TestRunRecord)
+            ).first()
+            if row is None:
+                if self.session.get(TestRunRecord, run_id) is None:
+                    raise RunNotFound()
+                raise RunConflict("Run has already been queued or started")
+            self.session.add(RunDispatch(run_id=run_id))
+        return row
+
+    def claim(self, run_id: UUID, task_id: UUID) -> TestRunRecord:
+        with self.session.begin():
+            row = self.session.scalars(
+                update(TestRunRecord)
+                .where(TestRunRecord.id == run_id, TestRunRecord.status == "QUEUED", TestRunRecord.task_id == task_id)
                 .values(status="RUNNING", started_at=func.now(), updated_at=func.now())
                 .returning(TestRunRecord)
             ).first()

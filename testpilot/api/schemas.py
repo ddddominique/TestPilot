@@ -39,7 +39,9 @@ class RunResponse(BaseModel):
     repository: str
     pr_number: int
     head_sha: Optional[str]
-    status: Literal["PENDING", "RUNNING", "COMPLETED", "FAILED"]
+    status: Literal["PENDING", "QUEUED", "RUNNING", "COMPLETED", "FAILED"]
+    queued_at: Optional[datetime]
+    task_id: Optional[UUID]
     framework: Optional[str]
     execution_outcome: Optional[ExecutionStatus]
     started_at: Optional[datetime]
