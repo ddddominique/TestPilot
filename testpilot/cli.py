@@ -1,4 +1,4 @@
-"""Command-line interface for Phase 1."""
+"""Command-line interface for context collection and optional test generation."""
 
 from __future__ import annotations
 

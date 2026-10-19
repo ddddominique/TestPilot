@@ -32,7 +32,8 @@ def test_collects_source_related_test_and_config():
     assert context.relevant_source_files == ["src/parser.py"]
     assert context.existing_tests == ["tests/test_parser.py"]
     assert context.testing_config == ["pyproject.toml"]
-    assert [item.category for item in context.files] == ["config", "test", "source"]
+    assert [item.category for item in context.files] == ["source", "config", "test"]
+    assert context.repository_files == ["src/parser.py", "tests/test_parser.py", "pyproject.toml"]
 
 
 @pytest.mark.parametrize(
@@ -64,21 +65,21 @@ def test_context_budget_truncates_and_reports_omissions():
     assert context.total_characters == 10
     assert context.total_characters <= context.max_characters
     assert any(item.truncated for item in context.files)
-    assert context.omitted_files == ["src/parser.py"]
+    assert context.omitted_files == ["tests/test_parser.py"]
     assert any("Omitted 1" in warning for warning in context.warnings)
 
 
-def test_small_budget_prioritizes_config_and_test_before_source():
+def test_small_budget_prioritizes_source_and_config_before_test():
     context = ContextCollector(FakeClient(), max_characters=30, max_files=2).collect(make_pr())
-    assert [item.category for item in context.files] == ["config", "test"]
+    assert [item.category for item in context.files] == ["source", "config"]
     assert all(item.content for item in context.files)
-    assert context.omitted_files == ["src/parser.py"]
+    assert context.omitted_files == ["tests/test_parser.py"]
     assert context.total_characters <= 30
 
 
 def test_file_limit_represents_config_test_and_source_when_possible():
     context = ContextCollector(FakeClient(), max_characters=100, max_files=3).collect(make_pr())
-    assert [item.category for item in context.files] == ["config", "test", "source"]
+    assert [item.category for item in context.files] == ["source", "config", "test"]
 
 
 def test_total_budget_includes_metadata_patches_and_files():
@@ -129,3 +130,39 @@ def test_new_test_prefixed_module_inside_python_package_is_changed_source():
         item.path == "testpilot/test_generator.py" and item.category == "source"
         for item in context.files
     )
+
+
+@pytest.mark.parametrize(
+    ("path", "tree", "is_test"),
+    [
+        ("test_parser.py", ["test_parser.py"], True),
+        ("app/test_parser.py", ["app/__init__.py", "app/test_parser.py"], False),
+        ("app/tests/test_parser.py", ["app/__init__.py", "app/tests/test_parser.py"], True),
+        ("src/parser.test.ts", ["src/parser.test.ts"], True),
+        ("src/latest.ts", ["src/latest.ts"], False),
+    ],
+)
+def test_ambiguous_source_and_test_classification(path, tree, is_test):
+    client = FakeClient()
+    client.contents = {item: "code" for item in tree}
+    pr = PullRequest(
+        "a", "b", 1, "title", "", "base", "head",
+        [ChangedFile(path, "modified", 1, 0, 1, "+code")],
+    )
+    context = ContextCollector(client).collect(pr)
+    assert (path in context.existing_tests) is is_test
+    assert (path in context.relevant_source_files) is (not is_test)
+
+
+def test_patch_truncation_prefers_complete_lines_and_reports_warning():
+    client = FakeClient()
+    client.contents["src/parser.py"] = "line one\nline two\nline three\n"
+    pr = PullRequest(
+        "a", "b", 1, "title", "", "base", "head",
+        [ChangedFile("src/parser.py", "modified", 3, 0, 3,
+                     "@@ -1 +1 @@\n+one\n@@ -9 +9 @@\n+two\n+three\n")],
+    )
+    context = ContextCollector(client, max_characters=45).collect(pr)
+    assert context.total_characters <= 45
+    assert any(patch.truncated for patch in context.patches)
+    assert any("Patch context truncated" in warning for warning in context.warnings)
