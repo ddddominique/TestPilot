@@ -26,6 +26,57 @@ PYTHON_SUFFIXES = {".py", ".pyi"}
 JAVASCRIPT_SUFFIXES = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
 
 
+def select_framework(
+    context: CollectedContext,
+    override: Optional[str] = None,
+    detection: Optional[FrameworkDetection] = None,
+) -> FrameworkDetection:
+    """Select once from evidence, an explicit override, or Python-only changes."""
+    detected = detection if detection is not None else detect_framework(context)
+    paths = context.relevant_source_files
+    if not paths:
+        raise ValueError("Framework selection failed: no relevant changed source files are available")
+    suffixes = {PurePosixPath(path).suffix.lower() for path in paths}
+    if override is not None:
+        if override not in FRAMEWORK_LANGUAGE:
+            raise ValueError("Unsupported framework override; choose pytest, jest, or vitest")
+        selected = FrameworkDetection(
+            FRAMEWORK_LANGUAGE[override], override,
+            [f"Explicit --framework {override} override for changed files: {', '.join(paths)}", *detected.evidence],
+            [f"Framework explicitly selected by the user; repository detection returned {detected.framework}."],
+            selection="override",
+        )
+    elif detected.is_supported:
+        selected = detected
+    elif detected.selection == "conflicting":
+        raise ValueError(
+            "Framework selection failed: conflicting repository framework evidence. "
+            "Choose a compatible --framework pytest, jest, or vitest explicitly."
+        )
+    elif suffixes <= PYTHON_SUFFIXES:
+        selected = FrameworkDetection(
+            "python", "pytest",
+            [f"All relevant changed source files are Python: {', '.join(paths)}"],
+            ["No supported framework evidence was found; pytest was inferred from Python-only changes."],
+            selection="inferred",
+        )
+    else:
+        raise ValueError(
+            "Framework selection failed: no framework evidence and changes are mixed-language, "
+            "unsupported, or require an explicit JS/TS framework. "
+            f"Changed source files: {', '.join(paths)}. "
+            "Use --framework only when compatible with all changed sources."
+        )
+    compatible = PYTHON_SUFFIXES if selected.framework == "pytest" else JAVASCRIPT_SUFFIXES
+    incompatible = [path for path in paths if PurePosixPath(path).suffix.lower() not in compatible]
+    if incompatible:
+        raise ValueError(
+            f"Framework {selected.framework} is incompatible with changed source files: "
+            f"{', '.join(incompatible)}. Mixed-language PRs require separate language-specific changes."
+        )
+    return selected
+
+
 def detect_framework(context: CollectedContext) -> FrameworkDetection:
     scores = {"pytest": 0, "jest": 0, "vitest": 0}
     evidence: dict[str, list[str]] = {name: [] for name in scores}
@@ -40,12 +91,14 @@ def detect_framework(context: CollectedContext) -> FrameworkDetection:
         return FrameworkDetection(
             "unknown", "unknown", [],
             ["No supported test framework evidence was found in relevant configuration, dependencies, or imports."],
+            selection="unknown",
         )
     if len(winners) > 1:
         details = ", ".join(f"{name}={scores[name]}" for name in sorted(winners))
         return FrameworkDetection(
             "unknown", "unknown", [],
             [f"Conflicting framework evidence ({details}); refusing to guess."],
+            selection="conflicting",
         )
     framework = winners[0]
     return FrameworkDetection(FRAMEWORK_LANGUAGE[framework], framework, evidence[framework])

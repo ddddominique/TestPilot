@@ -26,6 +26,8 @@ class PullRequest:
     head_sha: str
     files: list[ChangedFile]
     warnings: list[str] = field(default_factory=list)
+    head_owner: Optional[str] = None
+    head_repository: Optional[str] = None
 
 
 @dataclass(frozen=True)
